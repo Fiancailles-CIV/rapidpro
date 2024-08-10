@@ -8,7 +8,7 @@ from django.utils import timezone
 
 from temba.channels.models import Channel
 from temba.contacts.models import ContactGroup
-from temba.contacts.search.omnibox import omnibox_serialize
+from temba.contacts.omnibox import omnibox_serialize
 from temba.flows.models import Flow
 from temba.schedules.models import Schedule
 from temba.tests import CRUDLTestMixin, TembaTest
@@ -54,12 +54,12 @@ class TriggerTest(TembaTest):
         )
 
         self.assertEqual("Keyword[join] → Test Flow", keyword1.name)
-        self.assertEqual("<Trigger: type=K flow=Test Flow>", repr(keyword1))
+        self.assertEqual(f'<Trigger: id={keyword1.id} type=K flow="Test Flow">', repr(keyword1))
         self.assertEqual(2, keyword1.priority)
         self.assertEqual(3, keyword2.priority)
 
         self.assertEqual("Catch All → Test Flow", catchall1.name)
-        self.assertEqual("<Trigger: type=C flow=Test Flow>", repr(catchall1))
+        self.assertEqual(f'<Trigger: id={catchall1.id} type=C flow="Test Flow">', repr(catchall1))
         self.assertEqual(0, catchall1.priority)
         self.assertEqual(4, catchall2.priority)
 
@@ -802,7 +802,7 @@ class TriggerCRUDLTest(TembaTest, CRUDLTestMixin):
                 "repeat_days_of_week": ["M", "F"],
                 "flow": flow1.id,
                 "groups": [group1.id],
-                "contacts": omnibox_serialize(self.org, [], [contact1], json_encode=True),
+                "contacts": omnibox_serialize(self.org, [], [contact1], encode=True),
                 "exclude_groups": [group2.id],
             },
             new_obj_query=Trigger.objects.filter(trigger_type="S", flow=flow1),
@@ -827,7 +827,7 @@ class TriggerCRUDLTest(TembaTest, CRUDLTestMixin):
                 "repeat_days_of_week": ["M", "F"],
                 "flow": flow1.id,
                 "groups": [group1.id],
-                "contacts": omnibox_serialize(self.org, [], [contact1], json_encode=True),
+                "contacts": omnibox_serialize(self.org, [], [contact1], encode=True),
                 "exclude_groups": [group2.id],
             },
             new_obj_query=Trigger.objects.filter(trigger_type="S", flow=flow1).exclude(id=trigger.id),
@@ -1517,7 +1517,7 @@ class TriggerCRUDLTest(TembaTest, CRUDLTestMixin):
                 "flow": flow1.id,
                 "groups": [group2.id],
                 "exclude_groups": [group1.id],
-                "contacts": omnibox_serialize(self.org, (), [contact2], json_encode=True),
+                "contacts": omnibox_serialize(self.org, (), [contact2], encode=True),
             },
         )
 

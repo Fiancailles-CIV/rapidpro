@@ -12,6 +12,53 @@ NUM_BASE_QUERIES = 4  # number of queries required for any request (internal API
 
 
 class EndpointsTest(APITestMixin, TembaTest):
+    def test_locations(self):
+        endpoint_url = reverse("api.internal.locations") + ".json"
+
+        self.assertGetNotPermitted(endpoint_url, [None])
+        self.assertPostNotAllowed(endpoint_url)
+        self.assertDeleteNotAllowed(endpoint_url)
+
+        # no country, no results
+        self.assertGet(endpoint_url + "?level=state", [self.agent], results=[])
+
+        self.setUpLocations()
+
+        self.assertGet(
+            endpoint_url + "?level=state",
+            [self.agent],
+            results=[
+                {"osm_id": "171591", "name": "Eastern Province", "path": "Rwanda > Eastern Province"},
+                {"osm_id": "1708283", "name": "Kigali City", "path": "Rwanda > Kigali City"},
+            ],
+            num_queries=NUM_BASE_QUERIES + 2,
+        )
+        self.assertGet(
+            endpoint_url + "?level=district",
+            [self.user],
+            results=[
+                {"osm_id": "R1711131", "name": "Gatsibo", "path": "Rwanda > Eastern Province > Gatsibo"},
+                {"osm_id": "1711163", "name": "Kayônza", "path": "Rwanda > Eastern Province > Kayônza"},
+                {"osm_id": "3963734", "name": "Nyarugenge", "path": "Rwanda > Kigali City > Nyarugenge"},
+                {"osm_id": "1711142", "name": "Rwamagana", "path": "Rwanda > Eastern Province > Rwamagana"},
+            ],
+        )
+
+        # can query on path
+        self.assertGet(
+            endpoint_url + "?level=district&query=ga",
+            [self.editor],
+            results=[
+                {"osm_id": "R1711131", "name": "Gatsibo", "path": "Rwanda > Eastern Province > Gatsibo"},
+                {"osm_id": "3963734", "name": "Nyarugenge", "path": "Rwanda > Kigali City > Nyarugenge"},
+                {"osm_id": "1711142", "name": "Rwamagana", "path": "Rwanda > Eastern Province > Rwamagana"},
+            ],
+        )
+
+        # missing or invalid level, no results
+        self.assertGet(endpoint_url + "?level=hood", [self.agent], results=[])
+        self.assertGet(endpoint_url, [self.agent], results=[])
+
     def test_notifications(self):
         endpoint_url = reverse("api.internal.notifications") + ".json"
 
@@ -82,131 +129,93 @@ class EndpointsTest(APITestMixin, TembaTest):
         self.assertPostNotAllowed(endpoint_url)
         self.assertDeleteNotAllowed(endpoint_url)
 
+        tpl1 = self.create_template(
+            "hello",
+            [
+                TemplateTranslation(
+                    channel=self.channel,
+                    locale="eng-US",
+                    status=TemplateTranslation.STATUS_APPROVED,
+                    external_id="1234",
+                    external_locale="en_US",
+                    namespace="foo_namespace",
+                    components=[
+                        {
+                            "name": "body",
+                            "type": "body/text",
+                            "content": "Hi {{1}}",
+                            "variables": {"1": 0},
+                        }
+                    ],
+                    variables=[{"type": "text"}],
+                ),
+                TemplateTranslation(
+                    channel=self.channel,
+                    locale="fra-FR",
+                    status=TemplateTranslation.STATUS_PENDING,
+                    external_id="5678",
+                    external_locale="fr_FR",
+                    namespace="foo_namespace",
+                    components=[
+                        {
+                            "name": "body",
+                            "type": "body/text",
+                            "content": "Bonjour {{1}}",
+                            "variables": {"1": 0},
+                        }
+                    ],
+                    variables=[{"type": "text"}],
+                ),
+            ],
+        )
+        tpl2 = self.create_template(
+            "goodbye",
+            [
+                TemplateTranslation(
+                    channel=self.channel,
+                    locale="eng-US",
+                    status=TemplateTranslation.STATUS_PENDING,
+                    external_id="6789",
+                    external_locale="en_US",
+                    namespace="foo_namespace",
+                    components=[
+                        {
+                            "name": "body",
+                            "type": "body/text",
+                            "content": "Goodbye {{1}}",
+                            "variables": {"1": 0},
+                        }
+                    ],
+                    variables=[{"type": "text"}],
+                )
+            ],
+        )
+
+        # template on other org to test filtering
         org2channel = self.create_channel("A", "Org2Channel", "123456", country="RW", org=self.org2)
-
-        # create some templates
-        tpl1 = TemplateTranslation.get_or_create(
-            self.channel,
-            "hello",
-            locale="eng-US",
-            status=TemplateTranslation.STATUS_APPROVED,
-            external_id="1234",
-            external_locale="en_US",
-            namespace="foo_namespace",
-            components=[
-                {
-                    "name": "body",
-                    "type": "body/text",
-                    "content": "Hi {{1}}",
-                    "variables": {"1": 0},
-                    "params": [{"type": "text"}],
-                }
-            ],
-            variables=[{"type": "text"}],
-        ).template
-        TemplateTranslation.get_or_create(
-            self.channel,
-            "hello",
-            locale="fra-FR",
-            status=TemplateTranslation.STATUS_PENDING,
-            external_id="5678",
-            external_locale="fr_FR",
-            namespace="foo_namespace",
-            components=[
-                {
-                    "name": "body",
-                    "type": "body/text",
-                    "content": "Bonjour {{1}}",
-                    "variables": {"1": 0},
-                    "params": [{"type": "text"}],
-                }
-            ],
-            variables=[{"type": "text"}],
-        )
-        tt = TemplateTranslation.get_or_create(
-            self.channel,
-            "hello",
-            locale="afr-ZA",
-            status=TemplateTranslation.STATUS_APPROVED,
-            external_id="9012",
-            external_locale="af_ZA",
-            namespace="foo_namespace",
-            components=[
-                {
-                    "name": "body",
-                    "type": "body/text",
-                    "content": "This is a template translation for a deleted channel {{1}}",
-                    "variables": {"1": 0},
-                    "params": [{"type": "text"}],
-                }
-            ],
-            variables=[{"type": "text"}],
-        )
-        tt.is_active = False
-        tt.save()
-
-        tpl2 = TemplateTranslation.get_or_create(
-            self.channel,
+        self.create_template(
             "goodbye",
-            locale="eng-US",
-            status=TemplateTranslation.STATUS_PENDING,
-            external_id="6789",
-            external_locale="en_US",
-            namespace="foo_namespace",
-            components=[
-                {
-                    "name": "body",
-                    "type": "body/text",
-                    "content": "Goodbye {{1}}",
-                    "variables": {"1": 0},
-                    "params": [{"type": "text"}],
-                }
+            [
+                TemplateTranslation(
+                    channel=org2channel,
+                    locale="eng-US",
+                    status=TemplateTranslation.STATUS_PENDING,
+                    external_id="6789",
+                    external_locale="en_US",
+                    namespace="foo_namespace",
+                    components=[
+                        {
+                            "name": "body",
+                            "type": "body/text",
+                            "content": "Goodbye {{1}}",
+                            "variables": {"1": 0},
+                        }
+                    ],
+                    variables=[{"type": "text"}],
+                )
             ],
-            variables=[{"type": "text"}],
-        ).template
-
-        # templates on other org to test filtering
-        TemplateTranslation.get_or_create(
-            org2channel,
-            "goodbye",
-            locale="eng-US",
-            status=TemplateTranslation.STATUS_APPROVED,
-            external_id="1234",
-            external_locale="en_US",
-            namespace="bar_namespace",
-            components=[
-                {
-                    "name": "body",
-                    "type": "body/text",
-                    "content": "Goodbye {{1}}",
-                    "variables": {"1": 0},
-                    "params": [{"type": "text"}],
-                }
-            ],
-            variables=[{"type": "text"}],
+            org=self.org2,
         )
-        TemplateTranslation.get_or_create(
-            org2channel,
-            "goodbye",
-            locale="fra-FR",
-            status=TemplateTranslation.STATUS_PENDING,
-            external_id="5678",
-            external_locale="fr_FR",
-            namespace="bar_namespace",
-            components=[
-                {
-                    "name": "body",
-                    "type": "body/text",
-                    "content": "Salut {{1}}",
-                    "variables": {"1": 0},
-                    "params": [{"type": "text"}],
-                }
-            ],
-            variables=[{"type": "text"}],
-        )
-
-        tpl1.refresh_from_db()
-        tpl2.refresh_from_db()
 
         # no filtering
         self.assertGet(
@@ -214,66 +223,48 @@ class EndpointsTest(APITestMixin, TembaTest):
             [self.user, self.editor],
             results=[
                 {
-                    "name": "goodbye",
                     "uuid": str(tpl2.uuid),
-                    "translations": [
-                        {
-                            "channel": {"name": self.channel.name, "uuid": self.channel.uuid},
-                            "locale": "eng-US",
-                            "namespace": "foo_namespace",
-                            "status": "pending",
-                            "components": [
-                                {
-                                    "name": "body",
-                                    "type": "body/text",
-                                    "content": "Goodbye {{1}}",
-                                    "variables": {"1": 0},
-                                    "params": [{"type": "text"}],
-                                }
-                            ],
-                            "variables": [{"type": "text"}],
-                        },
-                    ],
+                    "name": "goodbye",
+                    "base_translation": {
+                        "channel": {"name": self.channel.name, "uuid": self.channel.uuid},
+                        "locale": "eng-US",
+                        "namespace": "foo_namespace",
+                        "status": "pending",
+                        "components": [
+                            {
+                                "name": "body",
+                                "type": "body/text",
+                                "content": "Goodbye {{1}}",
+                                "variables": {"1": 0},
+                            }
+                        ],
+                        "variables": [{"type": "text"}],
+                        "supported": True,
+                        "compatible": True,
+                    },
                     "created_on": matchers.ISODate(),
                     "modified_on": matchers.ISODate(),
                 },
                 {
-                    "name": "hello",
                     "uuid": str(tpl1.uuid),
-                    "translations": [
-                        {
-                            "channel": {"name": self.channel.name, "uuid": self.channel.uuid},
-                            "locale": "eng-US",
-                            "namespace": "foo_namespace",
-                            "status": "approved",
-                            "components": [
-                                {
-                                    "name": "body",
-                                    "type": "body/text",
-                                    "content": "Hi {{1}}",
-                                    "variables": {"1": 0},
-                                    "params": [{"type": "text"}],
-                                }
-                            ],
-                            "variables": [{"type": "text"}],
-                        },
-                        {
-                            "channel": {"name": self.channel.name, "uuid": self.channel.uuid},
-                            "locale": "fra-FR",
-                            "namespace": "foo_namespace",
-                            "status": "pending",
-                            "components": [
-                                {
-                                    "name": "body",
-                                    "type": "body/text",
-                                    "content": "Bonjour {{1}}",
-                                    "variables": {"1": 0},
-                                    "params": [{"type": "text"}],
-                                }
-                            ],
-                            "variables": [{"type": "text"}],
-                        },
-                    ],
+                    "name": "hello",
+                    "base_translation": {
+                        "channel": {"name": self.channel.name, "uuid": self.channel.uuid},
+                        "locale": "eng-US",
+                        "namespace": "foo_namespace",
+                        "status": "approved",
+                        "components": [
+                            {
+                                "name": "body",
+                                "type": "body/text",
+                                "content": "Hi {{1}}",
+                                "variables": {"1": 0},
+                            }
+                        ],
+                        "variables": [{"type": "text"}],
+                        "supported": True,
+                        "compatible": True,
+                    },
                     "created_on": matchers.ISODate(),
                     "modified_on": matchers.ISODate(),
                 },

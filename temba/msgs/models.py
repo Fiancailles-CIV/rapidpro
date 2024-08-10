@@ -21,11 +21,10 @@ from django.utils.translation import gettext_lazy as _
 
 from temba import mailroom
 from temba.channels.models import Channel, ChannelLog
-from temba.contacts import search
 from temba.contacts.models import Contact, ContactGroup, ContactURN
 from temba.orgs.models import DependencyMixin, Export, ExportType, Org
 from temba.schedules.models import Schedule
-from temba.utils import chunk_list, on_transaction_commit
+from temba.utils import chunk_list, languages, on_transaction_commit
 from temba.utils.export.models import MultiSheetExporter
 from temba.utils.models import JSONAsTextField, SquashableModel, TembaModel
 from temba.utils.s3 import public_file_storage
@@ -197,11 +196,15 @@ class Broadcast(models.Model):
     contacts = models.ManyToManyField(Contact, related_name="addressed_broadcasts")
     urns = ArrayField(models.TextField(), null=True)
     query = models.TextField(null=True)
+    node_uuid = models.UUIDField(null=True)
+    exclusions = models.JSONField(default=dict, null=True)
 
-    # message content in different languages, e.g. {"eng": {"text": "Hello", "attachments": [...]}, "spa": ...}
-    translations = models.JSONField()
+    # message content
+    translations = models.JSONField()  # text, attachments and quick replies by language
     base_language = models.CharField(max_length=3)  # ISO-639-3
     optin = models.ForeignKey("msgs.OptIn", null=True, on_delete=models.PROTECT)
+    template = models.ForeignKey("templates.Template", null=True, on_delete=models.PROTECT)
+    template_variables = ArrayField(models.TextField(), null=True)
 
     status = models.CharField(max_length=1, choices=STATUS_CHOICES, default=STATUS_QUEUED)
     created_by = models.ForeignKey(User, null=True, on_delete=models.PROTECT, related_name="broadcast_creations")
@@ -219,36 +222,40 @@ class Broadcast(models.Model):
         cls,
         org,
         user,
-        translations: dict[str, dict] = None,
+        translations: dict[str, dict],
         *,
-        base_language: str = None,
-        groups=None,
-        contacts=None,
-        urns: list[str] = None,
-        contact_ids: list[int] = None,
-        **kwargs,
+        base_language: str,
+        groups=(),
+        contacts=(),
+        urns=(),
+        query=None,
+        node_uuid=None,
+        exclude=None,
+        optin=None,
+        template=None,
+        template_variables=(),
+        schedule=None,
     ):
-        assert groups or contacts or contact_ids or urns, "can't create broadcast without recipients"
-
-        # if base language is not provided
-        if not base_language:
-            base_language = next(iter(translations))
-
+        assert groups or contacts or urns or query or node_uuid, "can't create broadcast without recipients"
+        assert base_language and languages.get_name(base_language), f"{base_language} is not a valid language code"
         assert base_language in translations, "no translation for base language"
 
-        broadcast = cls.objects.create(
-            org=org,
+        return mailroom.get_client().msg_broadcast(
+            org,
+            user,
             translations=translations,
             base_language=base_language,
-            created_by=user,
-            modified_by=user,
-            **kwargs,
+            groups=groups,
+            contacts=contacts,
+            urns=urns,
+            query=query,
+            node_uuid=node_uuid,
+            exclude=exclude,
+            optin=optin,
+            template=template,
+            template_variables=template_variables,
+            schedule=schedule,
         )
-
-        # set our recipients
-        broadcast._set_recipients(groups=groups, contacts=contacts, urns=urns, contact_ids=contact_ids)
-
-        return broadcast
 
     @classmethod
     def get_queued(cls, org):
@@ -263,15 +270,9 @@ class Broadcast(models.Model):
         Requests a preview of the recipients of a broadcast created with the given inclusions/exclusions, returning a
         tuple of the canonical query and the total count of contacts.
         """
-        preview = search.preview_broadcast(org, include=include, exclude=exclude)
+        preview = mailroom.get_client().msg_broadcast_preview(org, include=include, exclude=exclude)
 
         return preview.query, preview.total
-
-    def send_async(self):
-        """
-        Queues this broadcast for sending by mailroom
-        """
-        mailroom.queue_broadcast(self)
 
     def has_pending_fire(self):  # pragma: needs cover
         return self.schedule and self.schedule.next_fire is not None
@@ -289,7 +290,8 @@ class Broadcast(models.Model):
         """
 
         def trans(d):
-            return {"text": "", "attachments": [], "quick_replies": []} | d  # ensure we always have text+attachments
+            # ensure that we have all fields
+            return {"text": "", "attachments": [], "quick_replies": []} | d
 
         if contact and contact.language and contact.language in self.org.flow_languages:  # try contact language
             if contact.language in self.translations:
@@ -326,7 +328,7 @@ class Broadcast(models.Model):
             if self.schedule:
                 self.schedule.delete()
 
-    def update_recipients(self, *, groups=None, contacts=None, urns: list[str] = None):
+    def update_recipients(self, *, groups=None, contacts=None):
         """
         Only used to update recipients for scheduled / repeating broadcasts
         """
@@ -334,27 +336,11 @@ class Broadcast(models.Model):
         self.groups.clear()
         self.contacts.clear()
 
-        self._set_recipients(groups=groups, contacts=contacts, urns=urns)
-
-    def _set_recipients(self, *, groups=None, contacts=None, urns: list[str] = None, contact_ids=None):
-        """
-        Sets the recipients which may be contact groups, contacts or contact URNs.
-        """
-        if groups:
+        if groups:  # pragma: no cover
             self.groups.add(*groups)
 
         if contacts:
             self.contacts.add(*contacts)
-
-        if urns:
-            self.urns = urns
-            self.save(update_fields=("urns",))
-
-        if contact_ids:
-            RelatedModel = self.contacts.through
-            for chunk in chunk_list(contact_ids, 1000):
-                bulk_contacts = [RelatedModel(contact_id=id, broadcast_id=self.id) for id in chunk]
-                RelatedModel.objects.bulk_create(bulk_contacts)
 
     def __repr__(self):
         return f'<Broadcast: id={self.id} text="{self.get_translation()["text"]}">'
@@ -539,6 +525,7 @@ class Msg(models.Model):
     direction = models.CharField(max_length=1, choices=DIRECTION_CHOICES)
     status = models.CharField(max_length=1, choices=STATUS_CHOICES, default=STATUS_PENDING, db_index=True)
     visibility = models.CharField(max_length=1, choices=VISIBILITY_CHOICES, default=VISIBILITY_VISIBLE)
+    is_android = models.BooleanField(null=True)
     labels = models.ManyToManyField("Label", related_name="msgs")
 
     # the number of actual messages the channel sent this as (outgoing only)
@@ -597,7 +584,7 @@ class Msg(models.Model):
         Queues this message to be handled. Only used for manual retries of failed handling.
         """
 
-        mailroom.get_client().msg_handle(self.org_id, [self.id])
+        mailroom.get_client().msg_handle(self.org, [self])
 
     def archive(self):
         """
@@ -657,7 +644,7 @@ class Msg(models.Model):
     @classmethod
     def apply_action_resend(cls, user, msgs):
         if msgs:
-            mailroom.get_client().msg_resend(msgs[0].org.id, [m.id for m in msgs])
+            mailroom.get_client().msg_resend(msgs[0].org, list(msgs))
 
     @classmethod
     def bulk_soft_delete(cls, msgs: list):
@@ -697,8 +684,8 @@ class Msg(models.Model):
 
         cls.objects.filter(id__in=[m.id for m in msgs]).delete()
 
-    def __str__(self):  # pragma: needs cover
-        return self.text
+    def __repr__(self):  # pragma: no cover
+        return f'<Msg: id={self.id} text="{self.text}">'
 
     class Meta:
         indexes = [
@@ -710,6 +697,12 @@ class Msg(models.Model):
                 name="msgs_outgoing_to_retry",
                 fields=["next_attempt", "created_on", "id"],
                 condition=Q(direction="O", status__in=("I", "E"), next_attempt__isnull=False),
+            ),
+            # used for finding old Android messages to fail
+            models.Index(
+                name="msgs_outgoing_android_to_fail",
+                fields=["created_on"],
+                condition=Q(direction="O", is_android=True, status__in=("I", "Q", "E")),
             ),
             # used by courier to lookup messages by external id
             models.Index(

@@ -232,6 +232,30 @@ class ContactSearchWidget(forms.Widget):
     template_name = "utils/forms/contact_search.html"
     is_annotated = True
 
+    @classmethod
+    def get_recipients(cls, contacts=[], groups=[]) -> list:
+        recipients = []
+        for contact in contacts:
+            urn = contact.get_urn()
+            if urn:
+                urn = urn.get_display(org=contact.org, international=True)
+            recipients.append({"id": contact.uuid, "name": contact.name, "urn": urn, "type": "contact"})
+
+        for group in groups:
+            recipients.append(
+                {"id": group.uuid, "name": group.name, "count": group.get_member_count(), "type": "group"}
+            )
+        return recipients
+
+    @classmethod
+    def parse_recipients(cls, org, recipients: list) -> tuple:
+        group_uuids = [r.get("id") for r in recipients if r.get("type") == "group"]
+        contact_uuids = [r.get("id") for r in recipients if r.get("type") == "contact"]
+        return (
+            org.groups.filter(uuid__in=group_uuids),
+            org.contacts.filter(uuid__in=contact_uuids),
+        )
+
     def render(self, name, value, attrs=None, renderer=None):
         if value:
             value = json.loads(value)
@@ -276,17 +300,6 @@ class OmniboxChoice(forms.Widget):
         for item in data.getlist(name):
             selected.append(json.loads(item))
         return selected
-
-
-class OmniboxField(JSONField):
-    widget = OmniboxChoice()
-    default_country = None
-
-    def validate(self, value):
-        assert isinstance(value, list)
-
-        for item in value:
-            assert isinstance(item, dict) and "id" in item and "type" in item
 
 
 class ComposeWidget(forms.Widget):

@@ -60,7 +60,7 @@ class Topic(TembaModel, DependencyMixin):
 
     def release(self, user):
         assert not (self.is_system and self.org.is_active), "can't release system topics"
-
+        assert not self.tickets.exists(), "can't release topic with tickets"
         super().release(user)
 
         self.is_active = False
@@ -84,15 +84,12 @@ class Ticket(models.Model):
     # permission that users need to have a ticket assigned to them
     ASSIGNEE_PERMISSION = "tickets.ticket_assignee"
 
-    MAX_NOTE_LEN = 4096
+    MAX_NOTE_LENGTH = 10_000
 
     uuid = models.UUIDField(unique=True, default=uuid4)
     org = models.ForeignKey(Org, on_delete=models.PROTECT, related_name="tickets", db_index=False)  # indexed below
     contact = models.ForeignKey(Contact, on_delete=models.PROTECT, related_name="tickets", db_index=False)
-
-    # ticket content
     topic = models.ForeignKey(Topic, on_delete=models.PROTECT, related_name="tickets")
-    body = models.TextField()
 
     # the status of this ticket and who it's currently assigned to
     status = models.CharField(max_length=1, choices=STATUS_CHOICES)
@@ -118,29 +115,23 @@ class Ticket(models.Model):
 
     @classmethod
     def bulk_assign(cls, org, user: User, tickets: list, assignee: User):
-        ticket_ids = [t.id for t in tickets]
-        assignee_id = assignee.id if assignee else None
-        return mailroom.get_client().ticket_assign(org.id, user.id, ticket_ids, assignee_id)
+        return mailroom.get_client().ticket_assign(org, user, tickets, assignee)
 
     @classmethod
     def bulk_add_note(cls, org, user: User, tickets: list, note: str):
-        ticket_ids = [t.id for t in tickets]
-        return mailroom.get_client().ticket_add_note(org.id, user.id, ticket_ids, note)
+        return mailroom.get_client().ticket_add_note(org, user, tickets, note)
 
     @classmethod
     def bulk_change_topic(cls, org, user: User, tickets: list, topic: Topic):
-        ticket_ids = [t.id for t in tickets]
-        return mailroom.get_client().ticket_change_topic(org.id, user.id, ticket_ids, topic.id)
+        return mailroom.get_client().ticket_change_topic(org, user, tickets, topic)
 
     @classmethod
     def bulk_close(cls, org, user, tickets, *, force: bool = False):
-        ticket_ids = [t.id for t in tickets]
-        return mailroom.get_client().ticket_close(org.id, user.id, ticket_ids, force=force)
+        return mailroom.get_client().ticket_close(org, user, tickets, force=force)
 
     @classmethod
     def bulk_reopen(cls, org, user, tickets):
-        ticket_ids = [t.id for t in tickets]
-        return mailroom.get_client().ticket_reopen(org.id, user.id, ticket_ids)
+        return mailroom.get_client().ticket_reopen(org, user, tickets)
 
     @classmethod
     def get_allowed_assignees(cls, org):
@@ -195,7 +186,7 @@ class TicketEvent(models.Model):
     ticket = models.ForeignKey(Ticket, on_delete=models.PROTECT, related_name="events")
     contact = models.ForeignKey(Contact, on_delete=models.PROTECT, related_name="ticket_events")
     event_type = models.CharField(max_length=1, choices=TYPE_CHOICES)
-    note = models.TextField(null=True, max_length=Ticket.MAX_NOTE_LEN)
+    note = models.TextField(null=True, max_length=Ticket.MAX_NOTE_LENGTH)
     topic = models.ForeignKey(Topic, on_delete=models.PROTECT, null=True, related_name="ticket_events")
     assignee = models.ForeignKey(User, on_delete=models.PROTECT, null=True, related_name="ticket_assignee_events")
 

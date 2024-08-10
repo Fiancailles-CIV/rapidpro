@@ -22,18 +22,17 @@ from temba import mailroom
 from temba.airtime.models import AirtimeTransfer
 from temba.campaigns.models import Campaign, CampaignEvent, EventFire
 from temba.channels.models import ChannelEvent
-from temba.contacts.search import search_contacts
 from temba.flows.models import Flow, FlowSession, FlowStart
 from temba.ivr.models import Call
 from temba.locations.models import AdminBoundary
-from temba.mailroom import QueryMetadata, SearchResults, modifiers
-from temba.msgs.models import Broadcast, Msg, SystemLabel
+from temba.mailroom import modifiers
+from temba.msgs.models import Msg, SystemLabel
 from temba.orgs.models import Export, Org, OrgRole
 from temba.schedules.models import Schedule
 from temba.tests import CRUDLTestMixin, MigrationTest, MockResponse, TembaTest, matchers, mock_mailroom
 from temba.tests.engine import MockSessionWriter
 from temba.tests.s3 import MockS3Client
-from temba.tickets.models import Ticket, TicketCount
+from temba.tickets.models import Ticket, TicketCount, Topic
 from temba.triggers.models import Trigger
 from temba.utils import json
 from temba.utils.dates import datetime_to_timestamp
@@ -93,18 +92,8 @@ class ContactCRUDLTest(CRUDLTestMixin, TembaTest):
         self.assertRequestDisallowed(create_url, [None, self.agent, self.user])
         self.assertCreateFetch(create_url, [self.editor, self.admin], form_fields=("name", "phone"))
 
-        # simulate mailroom rejecting the number because it's invalid
-        mr_mocks.exception(mailroom.URNValidationException("URN 0 invalid", "invalid", 0))
-
-        self.assertCreateSubmit(
-            create_url,
-            self.admin,
-            {"name": "Joe", "phone": "+250781111111"},
-            form_errors={"phone": "Not a valid phone number."},
-        )
-
-        # simulate mailroom rejecting the number because it's taken
-        mr_mocks.exception(mailroom.URNValidationException("URN 0 in use", "taken", 0))
+        # simulate validation failing because phone number taken
+        mr_mocks.contact_urns({"tel:+250781111111": 12345678})
 
         self.assertCreateSubmit(
             create_url,
@@ -113,7 +102,27 @@ class ContactCRUDLTest(CRUDLTestMixin, TembaTest):
             form_errors={"phone": "In use by another contact."},
         )
 
-        # try when mailroom call succeeds
+        # simulate validation failing because phone number isn't E164
+        mr_mocks.contact_urns({"tel:+250781111111": False})
+
+        self.assertCreateSubmit(
+            create_url,
+            self.admin,
+            {"name": "Joe", "phone": "+250781111111"},
+            form_errors={"phone": "Ensure number includes country code."},
+        )
+
+        # simulate validation failing because phone number isn't valid
+        mr_mocks.contact_urns({"tel:xx": "URN 0 invalid"})
+
+        self.assertCreateSubmit(
+            create_url,
+            self.admin,
+            {"name": "Joe", "phone": "xx"},
+            form_errors={"phone": "Invalid phone number."},
+        )
+
+        # try valid number
         self.assertCreateSubmit(
             create_url,
             self.admin,
@@ -240,7 +249,7 @@ class ContactCRUDLTest(CRUDLTestMixin, TembaTest):
 
         # we re-run the search for the response, but exclude Joe
         self.assertEqual(
-            call(self.org.id, group_id=active_contacts.id, query="Joe", sort="", offset=0, exclude_ids=[joe.id]),
+            call(self.org, active_contacts, "Joe", sort="", offset=0, exclude_ids=[joe.id]),
             mr_mocks.calls["contact_search"][-1],
         )
 
@@ -459,16 +468,12 @@ class ContactCRUDLTest(CRUDLTestMixin, TembaTest):
         self.assertLoginRedirect(response)
 
         self.assertContentMenu(read_url, self.user, [])
-        self.assertContentMenu(read_url, self.editor, ["Start Flow", "Open Ticket", "-", "Edit"])
-        self.assertContentMenu(
-            read_url,
-            self.admin,
-            ["Start Flow", "Open Ticket", "-", "Edit"],
-        )
+        self.assertContentMenu(read_url, self.editor, ["Edit", "Start Flow", "Open Ticket"])
+        self.assertContentMenu(read_url, self.admin, ["Edit", "Start Flow", "Open Ticket"])
 
         # if there's an open ticket already, don't show open ticket option
-        self.create_ticket(joe, "Help")
-        self.assertContentMenu(read_url, self.editor, ["Start Flow", "-", "Edit"])
+        self.create_ticket(joe)
+        self.assertContentMenu(read_url, self.editor, ["Edit", "Start Flow"])
 
         # login as viewer
         self.login(self.user)
@@ -571,6 +576,25 @@ class ContactCRUDLTest(CRUDLTestMixin, TembaTest):
 
         # try to add a new invalid phone URN
         mr_mocks.contact_urns({"tel:123": "not a valid phone number"})
+
+        self.assertUpdateSubmit(
+            update_url,
+            self.admin,
+            {
+                "name": "Bobby",
+                "status": "B",
+                "language": "spa",
+                "groups": [testers.id],
+                "urn__tel__0": "+593979111111",
+                "new_scheme": "tel",
+                "new_path": "123",
+            },
+            form_errors={"new_path": "Invalid format."},
+            object_unchanged=contact,
+        )
+
+        # try to add a new phone URN that isn't E164
+        mr_mocks.contact_urns({"tel:123": False})
 
         self.assertUpdateSubmit(
             update_url,
@@ -775,11 +799,11 @@ class ContactCRUDLTest(CRUDLTestMixin, TembaTest):
         # create scheduled and regular broadcasts which send to both groups
         bcast1 = self.create_broadcast(
             self.admin,
-            "Hi again",
+            {"eng": {"text": "Hi again"}},
             contacts=[contact1, contact2],
             schedule=Schedule.create(self.org, timezone.now() + timedelta(days=3), Schedule.REPEAT_DAILY),
         )
-        self.create_broadcast(self.admin, "Bye", contacts=[contact1, contact2])  # not scheduled
+        self.create_broadcast(self.admin, {"eng": {"text": "Bye"}}, contacts=[contact1, contact2])  # not scheduled
 
         # create scheduled trigger which this contact is explicitly added to
         trigger1_flow = self.create_flow("Favorites 1")
@@ -868,7 +892,7 @@ class ContactCRUDLTest(CRUDLTestMixin, TembaTest):
         open_url = reverse("contacts.contact_open_ticket", args=[contact.id])
 
         self.assertRequestDisallowed(open_url, [None, self.user, self.agent, self.admin2])
-        self.assertUpdateFetch(open_url, [self.editor, self.admin], form_fields=("topic", "body", "assignee"))
+        self.assertUpdateFetch(open_url, [self.editor, self.admin], form_fields=("topic", "assignee", "note"))
 
         # can submit with no assignee
         response = self.assertUpdateSubmit(open_url, self.admin, {"topic": general.id, "body": "Help", "assignee": ""})
@@ -876,7 +900,6 @@ class ContactCRUDLTest(CRUDLTestMixin, TembaTest):
         # should have new ticket
         ticket = contact.tickets.get()
         self.assertEqual(general, ticket.topic)
-        self.assertEqual("Help", ticket.body)
         self.assertIsNone(ticket.assignee)
 
         # and we're redirected to that ticket
@@ -900,7 +923,7 @@ class ContactCRUDLTest(CRUDLTestMixin, TembaTest):
         MockSessionWriter(other_org_contact, self.create_flow("Test", org=self.org2)).wait().save()
 
         # now it's an option
-        self.assertContentMenu(read_url, self.admin, ["Start Flow", "Open Ticket", "-", "Interrupt", "Edit"])
+        self.assertContentMenu(read_url, self.admin, ["Edit", "Start Flow", "Open Ticket", "Interrupt"])
 
         # can't interrupt if not logged in
         self.client.logout()
@@ -1042,7 +1065,7 @@ class ContactGroupTest(TembaTest):
         self.assertEqual(ContactGroup.STATUS_INITIALIZING, group.status)
 
         # update group query
-        mr_mocks.parse_query("age > 18 and name ~ Mary", cleaned='age > 18 AND name ~ "Mary"')
+        mr_mocks.contact_parse_query("age > 18 and name ~ Mary", cleaned='age > 18 AND name ~ "Mary"')
         group.update_query("age > 18 and name ~ Mary")
         group.refresh_from_db()
 
@@ -1256,9 +1279,8 @@ class ContactGroupTest(TembaTest):
 
         # create scheduled and regular broadcasts which send to both groups
         schedule = Schedule.create(self.org, timezone.now(), Schedule.REPEAT_DAILY)
-        bcast1 = self.create_broadcast(self.admin, "Hi", groups=[group1, group2], schedule=schedule)
-        bcast2 = self.create_broadcast(self.admin, "Hi", groups=[group1, group2])
-        bcast2.send_async()
+        bcast1 = self.create_broadcast(self.admin, {"eng": {"text": "Hi"}}, groups=[group1, group2], schedule=schedule)
+        bcast2 = self.create_broadcast(self.admin, {"eng": {"text": "Hi"}}, groups=[group1, group2])
 
         # group still has a hard dependency so can't be released
         with self.assertRaises(AssertionError):
@@ -1694,39 +1716,46 @@ class ContactTest(TembaTest, CRUDLTestMixin):
             message="Sent 7 days after planting date",
         )
 
-    @patch("temba.mailroom.client.MailroomClient.contact_modify")
-    def test_block_and_stop(self, mock_contact_modify):
-        mock_contact_modify.return_value = {self.joe.id: {"contact": {}, "events": []}}
+    def test_contact_notes(self):
+        note_text = "This is note"
 
+        # create 10 notes
+        for i in range(10):
+            self.joe.set_note(self.user, f"{note_text} {i+1}")
+
+        notes = self.joe.notes.all().order_by("id")
+
+        # we should only have five notes after pruning
+        self.assertEqual(5, notes.count())
+
+        # check that the oldest notes are the ones that were pruned
+        self.assertEqual("This is note 6", notes.first().text)
+
+    @mock_mailroom
+    def test_block_and_stop(self, mr_mocks):
         self.joe.block(self.admin)
-
-        mock_contact_modify.assert_called_once_with(
-            self.org.id, self.admin.id, [self.joe.id], [modifiers.Status(status="blocked")]
-        )
-        mock_contact_modify.reset_mock()
-
         self.joe.stop(self.admin)
-
-        mock_contact_modify.assert_called_once_with(
-            self.org.id, self.admin.id, [self.joe.id], [modifiers.Status(status="stopped")]
-        )
-        mock_contact_modify.reset_mock()
-
         self.joe.restore(self.admin)
 
-        mock_contact_modify.assert_called_once_with(
-            self.org.id, self.admin.id, [self.joe.id], [modifiers.Status(status="active")]
+        self.assertEqual(
+            [
+                call(self.org, self.admin, [self.joe], [modifiers.Status(status="blocked")]),
+                call(self.org, self.admin, [self.joe], [modifiers.Status(status="stopped")]),
+                call(self.org, self.admin, [self.joe], [modifiers.Status(status="active")]),
+            ],
+            mr_mocks.calls["contact_modify"],
         )
-        mock_contact_modify.reset_mock()
 
     @mock_mailroom
     def test_open_ticket(self, mock_contact_modify):
         mock_contact_modify.return_value = {self.joe.id: {"contact": {}, "events": []}}
 
-        ticket = self.joe.open_ticket(self.admin, self.org.default_ticket_topic, "Looks sus", assignee=self.agent)
+        ticket = self.joe.open_ticket(
+            self.admin, topic=self.org.default_ticket_topic, assignee=self.agent, note="Looks sus"
+        )
 
         self.assertEqual(self.org.default_ticket_topic, ticket.topic)
-        self.assertEqual("Looks sus", ticket.body)
+        self.assertEqual("Looks sus", ticket.events.get(event_type="O").note)
 
     @mock_mailroom
     def test_interrupt(self, mr_mocks):
@@ -1746,7 +1775,7 @@ class ContactTest(TembaTest, CRUDLTestMixin):
         urn = old_contact.get_urn()
         self.create_channel_event(self.channel, urn.identity, ChannelEvent.TYPE_CALL_IN_MISSED)
 
-        self.create_ticket(old_contact, "Hi")
+        self.create_ticket(old_contact)
 
         ivr_flow = self.get_flow("ivr")
         msg_flow = self.get_flow("favorites_v13")
@@ -1763,8 +1792,10 @@ class ContactTest(TembaTest, CRUDLTestMixin):
 
         # create scheduled and regular broadcasts which send to both contacts
         schedule = Schedule.create(self.org, timezone.now(), Schedule.REPEAT_DAILY)
-        bcast1 = self.create_broadcast(self.admin, "Test", contacts=[contact, contact2], schedule=schedule)
-        bcast2 = self.create_broadcast(self.admin, "Test", contacts=[contact, contact2])
+        bcast1 = self.create_broadcast(
+            self.admin, {"eng": {"text": "Test"}}, contacts=[contact, contact2], schedule=schedule
+        )
+        bcast2 = self.create_broadcast(self.admin, {"eng": {"text": "Test"}}, contacts=[contact, contact2])
 
         flow_nodes = msg_flow.get_definition()["nodes"]
         color_prompt = flow_nodes[0]
@@ -1801,11 +1832,8 @@ class ContactTest(TembaTest, CRUDLTestMixin):
         self.create_incoming_call(msg_flow, contact)
 
         # give contact an open and a closed ticket
-        self.create_ticket(contact, "Hi")
-        self.create_ticket(contact, "Hi", closed_on=timezone.now())
-        bcast_ticket = self.create_ticket(contact, "Hi All")
-        bcast2.ticket = bcast_ticket
-        bcast2.save()
+        self.create_ticket(contact)
+        self.create_ticket(contact, closed_on=timezone.now())
 
         self.assertEqual(1, group.contacts.all().count())
         self.assertEqual(1, contact.calls.all().count())
@@ -1816,7 +1844,7 @@ class ContactTest(TembaTest, CRUDLTestMixin):
         self.assertEqual(2, len(contact.fields))
         self.assertEqual(1, contact.campaign_fires.count())
 
-        self.assertEqual(3, TicketCount.get_all(self.org, Ticket.STATUS_OPEN))
+        self.assertEqual(2, TicketCount.get_all(self.org, Ticket.STATUS_OPEN))
         self.assertEqual(1, TicketCount.get_all(self.org, Ticket.STATUS_CLOSED))
 
         # first try releasing with _full_release patched so we can check the state of the contact before the task
@@ -1830,7 +1858,7 @@ class ContactTest(TembaTest, CRUDLTestMixin):
             self.assertEqual(URN.DELETED_SCHEME, urn.scheme)
 
         # tickets unchanged
-        self.assertEqual(3, contact.tickets.count())
+        self.assertEqual(2, contact.tickets.count())
 
         # a new contact arrives with those urns
         new_contact = self.create_contact("URN Thief", urns=["tel:+12065552000", "twitter:tweettweet"])
@@ -1838,7 +1866,6 @@ class ContactTest(TembaTest, CRUDLTestMixin):
 
         self.assertEqual({contact2}, set(bcast1.contacts.all()))
         self.assertEqual({contact, contact2}, set(bcast2.contacts.all()))
-        self.assertIsNotNone(bcast2.ticket)
 
         # now lets go for a full release
         contact.release(self.admin)
@@ -2114,9 +2141,10 @@ class ContactTest(TembaTest, CRUDLTestMixin):
             Contact.bulk_inspect([self.joe, self.billy]),
         )
 
-    @patch("temba.contacts.search.omnibox.search_contacts")
     @mock_mailroom
-    def test_omnibox(self, mr_mocks, mock_search_contacts):
+    def test_omnibox(self, mr_mocks):
+        omnibox_url = reverse("contacts.contact_omnibox")
+
         # add a group with members and an empty group
         self.create_field("gender", "Gender")
         open_tickets = self.org.groups.get(name="Open Tickets")
@@ -2140,81 +2168,69 @@ class ContactTest(TembaTest, CRUDLTestMixin):
 
         self.login(self.admin)
 
-        def omnibox_request(query):
-            path = reverse("contacts.contact_omnibox")
-            response = self.client.get(f"{path}?{query}")
+        def omnibox_request(query: str):
+            response = self.client.get(omnibox_url + query)
             return response.json()["results"]
 
-        # configure mocking so we call actual search method but mailroom returns an error
+        # mock mailroom to return an error
         mr_mocks.exception(mailroom.QueryValidationException("ooh that doesn't look right", "syntax"))
-        mock_search_contacts.side_effect = search_contacts
 
         # error is swallowed and we show no results
-        self.assertEqual([], omnibox_request("search=-123`213"))
+        self.assertEqual([], omnibox_request("?search=-123`213"))
 
-        with self.assertNumQueries(14):
-            mock_search_contacts.side_effect = [
-                SearchResults(
-                    query="",
-                    total=4,
-                    contact_ids=[self.billy.id, self.frank.id, self.joe.id, self.voldemort.id],
-                    metadata=QueryMetadata(),
-                ),
-                SearchResults(query="", total=3, contact_ids=[], metadata=QueryMetadata()),
-            ]
+        # lookup specific contacts
+        self.assertEqual(
+            [
+                {"id": str(self.billy.uuid), "name": "Billy Nophone", "type": "contact", "urn": ""},
+                {"id": str(self.joe.uuid), "name": "Joe Blow", "type": "contact", "urn": "blow80"},
+            ],
+            omnibox_request(f"?c={self.joe.uuid},{self.billy.uuid}"),
+        )
 
+        # lookup specific groups
+        self.assertEqual(
+            [
+                {"id": str(joe_and_frank.uuid), "name": "Joe and Frank", "type": "group", "count": 2},
+                {"id": str(men.uuid), "name": "Men", "type": "group", "count": 0},
+            ],
+            omnibox_request(f"?g={joe_and_frank.uuid},{men.uuid}"),
+        )
+
+        # empty query just returns up to 25 groups A-Z
+        with self.assertNumQueries(10):
             self.assertEqual(
                 [
-                    # all 4 groups A-Z
                     {"id": str(joe_and_frank.uuid), "name": "Joe and Frank", "type": "group", "count": 2},
                     {"id": str(men.uuid), "name": "Men", "type": "group", "count": 0},
                     {"id": str(nobody.uuid), "name": "Nobody", "type": "group", "count": 0},
                     {"id": str(open_tickets.uuid), "name": "Open Tickets", "type": "group", "count": 0},
-                    # all 4 contacts A-Z
-                    {"id": str(self.billy.uuid), "name": "Billy Nophone", "type": "contact", "urn": ""},
-                    {"id": str(self.frank.uuid), "name": "Frank Smith", "type": "contact", "urn": "250782222222"},
-                    {"id": str(self.joe.uuid), "name": "Joe Blow", "type": "contact", "urn": "blow80"},
-                    {"id": str(self.voldemort.uuid), "name": "250768383383", "type": "contact", "urn": "250768383383"},
                 ],
-                omnibox_request(query=""),
+                omnibox_request(""),
             )
 
         with self.assertNumQueries(13):
-            mock_search_contacts.side_effect = [
-                SearchResults(query="", total=2, contact_ids=[self.billy.id, self.frank.id], metadata=QueryMetadata()),
-            ]
+            mr_mocks.contact_search(query='name ~ "250" OR urn ~ "250"', total=2, contacts=[self.billy, self.frank])
 
             self.assertEqual(
                 [
-                    # 2 contacts A-Z
                     {"id": str(self.billy.uuid), "name": "Billy Nophone", "type": "contact", "urn": ""},
                     {"id": str(self.frank.uuid), "name": "Frank Smith", "type": "contact", "urn": "250782222222"},
                 ],
-                omnibox_request(query="search=250"),
+                omnibox_request("?search=250"),
             )
 
         with self.assertNumQueries(14):
-            mock_search_contacts.side_effect = [
-                SearchResults(query="", total=2, contact_ids=[self.billy.id, self.frank.id], metadata=QueryMetadata()),
-            ]
+            mr_mocks.contact_search(query='name ~ "FRA" OR urn ~ "FRA"', total=1, contacts=[self.frank])
 
             self.assertEqual(
                 [
-                    # all 4 groups A-Z
                     {"id": str(joe_and_frank.uuid), "name": "Joe and Frank", "type": "group", "count": 2},
-                    {"id": str(men.uuid), "name": "Men", "type": "group", "count": 0},
-                    {"id": str(nobody.uuid), "name": "Nobody", "type": "group", "count": 0},
-                    {"id": str(open_tickets.uuid), "name": "Open Tickets", "type": "group", "count": 0},
-                    # 2 contacts A-Z
-                    {"id": str(self.billy.uuid), "name": "Billy Nophone", "type": "contact", "urn": ""},
                     {"id": str(self.frank.uuid), "name": "Frank Smith", "type": "contact", "urn": "250782222222"},
                 ],
-                omnibox_request(query=""),
+                omnibox_request("?search=FRA"),
             )
 
-        # apply type filters...
-
-        # g = just the 4 groups
+        # specify type filter g (all groups)
         self.assertEqual(
             [
                 {"id": str(joe_and_frank.uuid), "name": "Joe and Frank", "type": "group", "count": 2},
@@ -2222,48 +2238,36 @@ class ContactTest(TembaTest, CRUDLTestMixin):
                 {"id": str(nobody.uuid), "name": "Nobody", "type": "group", "count": 0},
                 {"id": str(open_tickets.uuid), "name": "Open Tickets", "type": "group", "count": 0},
             ],
-            omnibox_request("types=g"),
+            omnibox_request("?types=g"),
         )
 
-        # s = just the 2 non-query manual groups
+        # specify type filter s (non-query groups)
         self.assertEqual(
             [
                 {"id": str(joe_and_frank.uuid), "name": "Joe and Frank", "type": "group", "count": 2},
                 {"id": str(nobody.uuid), "name": "Nobody", "type": "group", "count": 0},
             ],
-            omnibox_request("types=s"),
-        )
-
-        # lookup by group id
-        self.assertEqual(
-            [{"id": str(joe_and_frank.uuid), "name": "Joe and Frank", "type": "group", "count": 2}],
-            omnibox_request(f"g={joe_and_frank.uuid}"),
+            omnibox_request("?types=s"),
         )
 
         with self.anonymous(self.org):
-            mock_search_contacts.side_effect = [
-                SearchResults(query="", total=1, contact_ids=[self.billy.id], metadata=QueryMetadata()),
-                SearchResults(query="", total=1, contact_ids=[self.billy.id], metadata=QueryMetadata()),
-            ]
             self.assertEqual(
                 [
-                    # all 4 groups A-Z
                     {"id": str(joe_and_frank.uuid), "name": "Joe and Frank", "type": "group", "count": 2},
                     {"id": str(men.uuid), "name": "Men", "type": "group", "count": 0},
                     {"id": str(nobody.uuid), "name": "Nobody", "type": "group", "count": 0},
                     {"id": str(open_tickets.uuid), "name": "Open Tickets", "type": "group", "count": 0},
-                    # 1 contact
-                    {"id": str(self.billy.uuid), "name": "Billy Nophone", "type": "contact"},
                 ],
                 omnibox_request(""),
             )
 
+            mr_mocks.contact_search(query='name ~ "Billy"', total=1, contacts=[self.billy])
+
             self.assertEqual(
                 [
-                    # 1 contact
                     {"id": str(self.billy.uuid), "name": "Billy Nophone", "type": "contact"},
                 ],
-                omnibox_request("search=Billy"),
+                omnibox_request("?search=Billy"),
             )
 
         # exclude blocked and stopped contacts
@@ -2271,7 +2275,7 @@ class ContactTest(TembaTest, CRUDLTestMixin):
         self.frank.stop(self.admin)
 
         # lookup by contact uuids
-        self.assertEqual(omnibox_request("c=%s,%s" % (self.joe.uuid, self.frank.uuid)), [])
+        self.assertEqual(omnibox_request("?c=%s,%s" % (self.joe.uuid, self.frank.uuid)), [])
 
     def test_history(self):
         url = reverse("contacts.contact_history", args=[self.joe.uuid])
@@ -2280,7 +2284,7 @@ class ContactTest(TembaTest, CRUDLTestMixin):
         self.joe.created_on = timezone.now() - timedelta(days=1000)
         self.joe.save(update_fields=("created_on",))
 
-        self.create_broadcast(self.user, "A beautiful broadcast", contacts=[self.joe])
+        self.create_broadcast(self.user, {"eng": {"text": "A beautiful broadcast"}}, contacts=[self.joe])
         self.create_campaign()
 
         # add a message with some attachments
@@ -2351,8 +2355,9 @@ class ContactTest(TembaTest, CRUDLTestMixin):
         EventFire.objects.create(event=self.planting_reminder, contact=self.joe, scheduled=scheduled, fired=scheduled)
 
         # two tickets for joe
-        self.create_ticket(self.joe, "Question 1", opened_on=timezone.now(), closed_on=timezone.now())
-        ticket = self.create_ticket(self.joe, "Question 2")
+        sales = Topic.create(self.org, self.admin, "Sales")
+        self.create_ticket(self.joe, opened_on=timezone.now(), closed_on=timezone.now())
+        ticket = self.create_ticket(self.joe, topic=sales)
 
         # create missed incoming and outgoing calls
         self.create_channel_event(
@@ -2409,7 +2414,7 @@ class ContactTest(TembaTest, CRUDLTestMixin):
 
         # history should include all messages in the last 90 days, the channel event, the call, and the flow run
         history = response.json()["events"]
-        self.assertEqual(98, len(history))
+        self.assertEqual(96, len(history))
 
         def assertHistoryEvent(events, index, expected_type, **kwargs):
             item = events[index]
@@ -2423,19 +2428,17 @@ class ContactTest(TembaTest, CRUDLTestMixin):
         assertHistoryEvent(history, 1, "channel_event", channel_event_type="new_conversation")
         assertHistoryEvent(history, 2, "channel_event", channel_event_type="mo_miss")
         assertHistoryEvent(history, 3, "channel_event", channel_event_type="mt_miss")
-        assertHistoryEvent(history, 4, "ticket_opened", ticket__body="Question 2")
-        assertHistoryEvent(history, 5, "ticket_closed", ticket__body="Question 1")
-        assertHistoryEvent(history, 6, "ticket_opened", ticket__body="Question 1")
+        assertHistoryEvent(history, 4, "ticket_opened", ticket__topic__name="Sales")
+        assertHistoryEvent(history, 5, "ticket_closed", ticket__topic__name="General")
+        assertHistoryEvent(history, 6, "ticket_opened", ticket__topic__name="General")
         assertHistoryEvent(history, 7, "airtime_transferred", actual_amount="100.00")
-        assertHistoryEvent(history, 8, "run_result_changed", value="green")
-        assertHistoryEvent(history, 9, "webhook_called", url="https://example.com/")
-        assertHistoryEvent(history, 10, "msg_created", msg__text="What is your favorite color?")
-        assertHistoryEvent(history, 11, "flow_entered", flow__name="Colors")
-        assertHistoryEvent(history, 12, "msg_received", msg__text="Message caption")
+        assertHistoryEvent(history, 8, "msg_created", msg__text="What is your favorite color?")
+        assertHistoryEvent(history, 9, "flow_entered", flow__name="Colors")
+        assertHistoryEvent(history, 10, "msg_received", msg__text="Message caption")
         assertHistoryEvent(
-            history, 13, "msg_created", msg__text="A beautiful broadcast", created_by__email="viewer@nyaruka.com"
+            history, 11, "msg_created", msg__text="A beautiful broadcast", created_by__email="viewer@nyaruka.com"
         )
-        assertHistoryEvent(history, 14, "campaign_fired", campaign__name="Planting Reminders")
+        assertHistoryEvent(history, 12, "campaign_fired", campaign__name="Planting Reminders")
         assertHistoryEvent(history, -1, "msg_received", msg__text="Inbound message 11")
 
         # revert back to reading only from DB
@@ -2447,7 +2450,7 @@ class ContactTest(TembaTest, CRUDLTestMixin):
         assertHistoryEvent(history, 0, "ticket_assigned", assignee__id=self.admin.id)
         assertHistoryEvent(history, 1, "ticket_note_added", note="I have a bad feeling about this")
         assertHistoryEvent(history, 5, "channel_event", channel_event_type="mt_miss")
-        assertHistoryEvent(history, 6, "ticket_opened", ticket__body="Question 2")
+        assertHistoryEvent(history, 6, "ticket_opened", ticket__topic__name="Sales")
         assertHistoryEvent(history, 7, "airtime_transferred", actual_amount="100.00")
 
         # fetch next page
@@ -2465,8 +2468,8 @@ class ContactTest(TembaTest, CRUDLTestMixin):
         response = self.fetch_protected(url + "?limit=100", self.admin)
         history = response.json()["events"]
 
-        self.assertEqual(98, len(history))
-        assertHistoryEvent(history, 10, "msg_created", msg__text="What is your favorite color?")
+        self.assertEqual(96, len(history))
+        assertHistoryEvent(history, 8, "msg_created", msg__text="What is your favorite color?")
 
         # if a new message comes in
         self.create_incoming_msg(self.joe, "Newer message")
@@ -2482,7 +2485,7 @@ class ContactTest(TembaTest, CRUDLTestMixin):
 
         # with our recent flag on, should not see the older messages
         events = response.json()["events"]
-        self.assertEqual(15, len(events))
+        self.assertEqual(13, len(events))
         self.assertContains(response, "file.mp4")
 
         # can't view history of contact in another org
@@ -2506,7 +2509,7 @@ class ContactTest(TembaTest, CRUDLTestMixin):
 
         response = self.fetch_protected(url + "?limit=200", self.admin)
         history = response.json()["events"]
-        self.assertEqual(102, len(history))
+        self.assertEqual(100, len(history))
 
         # before date should not match our last activity, that only happens when we truncate
         resp_json = response.json()
@@ -2527,10 +2530,8 @@ class ContactTest(TembaTest, CRUDLTestMixin):
         assertHistoryEvent(history, 9, "ticket_closed")
         assertHistoryEvent(history, 10, "ticket_opened")
         assertHistoryEvent(history, 11, "airtime_transferred")
-        assertHistoryEvent(history, 12, "run_result_changed")
-        assertHistoryEvent(history, 13, "webhook_called")
-        assertHistoryEvent(history, 14, "msg_created", msg__text="What is your favorite color?")
-        assertHistoryEvent(history, 15, "flow_entered")
+        assertHistoryEvent(history, 12, "msg_created", msg__text="What is your favorite color?")
+        assertHistoryEvent(history, 13, "flow_entered")
 
         # make our message event older than our planting reminder
         self.message_event.created_on = self.planting_reminder.created_on - timedelta(days=1)
@@ -2592,14 +2593,10 @@ class ContactTest(TembaTest, CRUDLTestMixin):
         self.assertEqual(200, response.status_code)
 
         resp_json = response.json()
-        self.assertEqual(13, len(resp_json["events"]))
+        self.assertEqual(9, len(resp_json["events"]))
         self.assertEqual(
             [
                 "flow_exited",
-                "failure",
-                "error",
-                "email_sent",
-                "run_result_changed",
                 "contact_name_changed",
                 "contact_name_changed",
                 "contact_language_changed",
@@ -2638,7 +2635,7 @@ class ContactTest(TembaTest, CRUDLTestMixin):
 
         self.assertEqual(0, self.joe.get_scheduled_broadcasts().count())
 
-        broadcast = Broadcast.create(self.org, self.admin, {"eng": "Hello"}, contacts=[self.frank])
+        broadcast = self.create_broadcast(self.admin, {"eng": {"text": "Hello"}}, contacts=[self.frank])
         self.assertEqual(0, self.joe.get_scheduled_broadcasts().count())
 
         broadcast.contacts.add(self.joe)
@@ -2798,12 +2795,12 @@ class ContactTest(TembaTest, CRUDLTestMixin):
             mods,
         )
 
-    @patch("temba.mailroom.client.MailroomClient.contact_modify")
-    def test_bulk_modify_with_no_contacts(self, mock_contact_modify):
-        mock_contact_modify.return_value = {}
+    @mock_mailroom
+    def test_bulk_modify_with_no_contacts(self, mr_mocks):
+        Contact.bulk_modify(self.admin, [], [modifiers.Language(language="spa")])
 
         # just a NOOP
-        Contact.bulk_modify(self.admin, [], [modifiers.Language(language="spa")])
+        self.assertEqual([], mr_mocks.calls["contact_modify"])
 
     @mock_mailroom
     def test_contact_model(self, mr_mocks):
@@ -3504,6 +3501,8 @@ class ContactFieldCRUDLTest(TembaTest, CRUDLTestMixin):
         self.assertListFetch(
             list_url, [self.user, self.editor, self.admin], context_objects=[self.age, self.gender, self.state]
         )
+        self.assertContentMenu(list_url, self.user, [])
+        self.assertContentMenu(list_url, self.admin, ["New Field"])
 
     def test_create_warnings(self):
         self.login(self.admin)
@@ -3777,7 +3776,7 @@ class URNTest(TembaTest):
 class ContactImportTest(TembaTest):
     def test_parse_errors(self):
         # try to open an import that is completely empty
-        with self.assertRaisesRegexp(ValidationError, "Import file appears to be empty."):
+        with self.assertRaisesRegex(ValidationError, "Import file appears to be empty."):
             ContactImport.try_to_parse(self.org, io.BytesIO(b""), "foo.csv")
 
         def try_to_parse(name):
@@ -3787,12 +3786,12 @@ class ContactImportTest(TembaTest):
 
         # try to open an import that exceeds the record limit
         with patch("temba.contacts.models.ContactImport.MAX_RECORDS", 2):
-            with self.assertRaisesRegexp(ValidationError, r"Import files can contain a maximum of 2 records\."):
+            with self.assertRaisesRegex(ValidationError, r"Import files can contain a maximum of 2 records\."):
                 try_to_parse("simple.xlsx")
 
         with patch("pyexcel.iget_array") as mock_iget_array:
             mock_iget_array.side_effect = xlrd.XLRDError("error")
-            with self.assertRaisesRegexp(
+            with self.assertRaisesRegex(
                 ValidationError, r"Import file appears to be corrupted. Please save again in Excel and try again."
             ):
                 try_to_parse("simple.csv")
@@ -3800,10 +3799,10 @@ class ContactImportTest(TembaTest):
         bad_files = [
             ("empty.csv", "Import file doesn't contain any records."),
             ("empty_header.xls", "Import file contains an empty header."),
-            ("duplicate_urn.xlsx", "Import file contains duplicated contact URN 'tel:+250788382382'."),
+            ("duplicate_urn.xlsx", "Import file contains duplicated contact URN 'tel:+250788382382' on row 4."),
             (
                 "duplicate_uuid.xlsx",
-                "Import file contains duplicated contact UUID 'f519ca1f-8513-49ba-8896-22bf0420dec7'.",
+                "Import file contains duplicated contact UUID 'f519ca1f-8513-49ba-8896-22bf0420dec7' on row 4.",
             ),
             ("invalid_scheme.xlsx", "Header 'URN:XXX' is not a valid URN type."),
             ("invalid_field_key.xlsx", "Header 'Field: #$^%' is not a valid field name."),
@@ -4392,7 +4391,7 @@ class ContactImportCRUDLTest(TembaTest, CRUDLTestMixin):
         imp = ContactImport.objects.get()
         self.assertEqual(self.org, imp.org)
         self.assertEqual(3, imp.num_records)
-        self.assertRegexpMatches(imp.file.name, rf"test_orgs/{self.org.id}/contact_imports/[\w-]{{36}}.xlsx$")
+        self.assertRegex(imp.file.name, rf"test_orgs/{self.org.id}/contact_imports/[\w-]{{36}}.xlsx$")
         self.assertEqual("simple.xlsx", imp.original_filename)
         self.assertIsNone(imp.started_on)
         self.assertIsNone(imp.group)

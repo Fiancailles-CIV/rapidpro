@@ -18,12 +18,15 @@ from django.urls import reverse
 from django.utils import timezone
 from django.utils.encoding import force_bytes
 
+from temba.apks.models import Apk
 from temba.contacts.models import URN, Contact
 from temba.msgs.models import Msg
-from temba.notifications.incidents.builtin import ChannelDisconnectedIncidentType
+from temba.notifications.incidents.builtin import ChannelDisconnectedIncidentType, ChannelOutdatedAppIncidentType
+from temba.notifications.models import Incident
 from temba.notifications.tasks import send_notification_emails
 from temba.orgs.models import Org
 from temba.request_logs.models import HTTPLog
+from temba.templates.models import TemplateTranslation
 from temba.tests import CRUDLTestMixin, MockResponse, TembaTest, matchers, mock_mailroom, override_brand
 from temba.tests.crudl import StaffRedirect
 from temba.triggers.models import Trigger
@@ -35,7 +38,6 @@ from .models import Channel, ChannelCount, ChannelEvent, ChannelLog, SyncEvent
 from .tasks import (
     check_android_channels,
     squash_channel_counts,
-    sync_old_seen_channels,
     track_org_channel_counts,
     trim_channel_events,
     trim_channel_logs,
@@ -191,6 +193,19 @@ class ChannelTest(TembaTest, CRUDLTestMixin):
             dict(p_src="AC", p_sts="DIS", p_lvl=80, net="WIFI", pending=[1, 2], retry=[3, 4], cc="RW"),
             [1, 2],
         )
+        self.create_template(
+            "reminder",
+            [
+                TemplateTranslation(
+                    channel=channel1,
+                    locale="eng",
+                    status="A",
+                    external_locale="en",
+                    components=[],
+                    variables=[],
+                )
+            ],
+        )
 
         # and some on another channel
         self.create_outgoing_msg(contact, "Hi", channel=channel2, status="E")
@@ -199,6 +214,19 @@ class ChannelTest(TembaTest, CRUDLTestMixin):
             channel2,
             dict(p_src="AC", p_sts="DIS", p_lvl=80, net="WIFI", pending=[1, 2], retry=[3, 4], cc="RW"),
             [1, 2],
+        )
+        self.create_template(
+            "reminder2",
+            [
+                TemplateTranslation(
+                    channel=channel2,
+                    locale="eng",
+                    status="A",
+                    external_locale="en",
+                    components=[],
+                    variables=[],
+                )
+            ],
         )
         Trigger.create(self.org, self.admin, Trigger.TYPE_CATCH_ALL, flow, channel=channel2)
 
@@ -212,6 +240,7 @@ class ChannelTest(TembaTest, CRUDLTestMixin):
         self.assertNotIn(channel1, flow.channel_dependencies.all())
         self.assertEqual(0, channel1.triggers.filter(is_active=True).count())
         self.assertEqual(0, channel1.incidents.filter(ended_on=None).count())
+        self.assertEqual(0, channel1.template_translations.count())
 
         # check that we queued a task to interrupt sessions tied to this channel
         self.assertEqual(
@@ -229,6 +258,7 @@ class ChannelTest(TembaTest, CRUDLTestMixin):
         self.assertEqual(1, channel2.sync_events.count())
         self.assertEqual(1, channel2.triggers.filter(is_active=True).count())
         self.assertEqual(1, channel2.incidents.filter(ended_on=None).count())
+        self.assertEqual(1, channel2.template_translations.count())
 
         # now do actual delete of channel
         channel1.msgs.all().delete()
@@ -252,8 +282,9 @@ class ChannelTest(TembaTest, CRUDLTestMixin):
         # should be a rel cmd to instruct app to reset
         self.assertEqual({"cmds": [{"cmd": "rel", "relayer_id": str(android.id)}]}, response.json())
 
-        # and FCM ID now cleared
-        self.assertIsNone(android.config.get(Channel.CONFIG_FCM_ID))
+        self.assertFalse(android.is_active)
+        # and FCM ID now kept
+        self.assertEqual("FCM111", android.config.get(Channel.CONFIG_FCM_ID))
 
     def sync(self, channel, *, cmds, signature=None, auto_add_fcm=True):
         # prepend FCM command if not included
@@ -664,6 +695,8 @@ class ChannelTest(TembaTest, CRUDLTestMixin):
         date = timezone.now()
         date = int(time.mktime(date.timetuple())) * 1000
 
+        Apk.objects.create(apk_type=Apk.TYPE_RELAYER, version="1.0.0")
+
         contact1 = self.create_contact("Ann", phone="+250788382382")
         contact2 = self.create_contact("Bob", phone="+250788383383")
 
@@ -738,6 +771,7 @@ class ChannelTest(TembaTest, CRUDLTestMixin):
                 p_src="BAT",
                 p_lvl="60",
                 net="UMTS",
+                app_version="0.9.9",
                 org_id=8,
                 retry=[msg6.pk],
                 pending=[],
@@ -798,6 +832,14 @@ class ChannelTest(TembaTest, CRUDLTestMixin):
         # We should have 3 channel event
         self.assertEqual(3, ChannelEvent.objects.filter(channel=self.tel_channel).count())
 
+        # We should have an incident for the app version
+        self.assertEqual(
+            1,
+            Incident.objects.filter(
+                incident_type=ChannelOutdatedAppIncidentType.slug, ended_on=None, channel=self.tel_channel
+            ).count(),
+        )
+
         # check our channel fcm and uuid were updated
         self.tel_channel = Channel.objects.get(pk=self.tel_channel.pk)
         self.assertEqual("12345", self.tel_channel.config["FCM_ID"])
@@ -820,11 +862,34 @@ class ChannelTest(TembaTest, CRUDLTestMixin):
             self.tel_channel,
             cmds=[
                 # device details status
-                dict(cmd="status", p_sts="DIS", p_src="BAT", p_lvl="15", net="UMTS", pending=[], retry=[])
+                dict(
+                    cmd="status",
+                    p_sts="DIS",
+                    p_src="BAT",
+                    p_lvl="15",
+                    net="UMTS",
+                    app_version="1.0.0",
+                    pending=[],
+                    retry=[],
+                )
             ],
         )
 
         self.assertEqual(2, SyncEvent.objects.all().count())
+
+        # We should have all incident for the app version ended
+        self.assertEqual(
+            1,
+            Incident.objects.filter(
+                incident_type=ChannelOutdatedAppIncidentType.slug, channel=self.tel_channel
+            ).count(),
+        )
+        self.assertEqual(
+            0,
+            Incident.objects.filter(
+                incident_type=ChannelOutdatedAppIncidentType.slug, ended_on=None, channel=self.tel_channel
+            ).count(),
+        )
 
         # make our events old so we can test trimming them
         SyncEvent.objects.all().update(created_on=timezone.now() - timedelta(days=45))
@@ -1059,28 +1124,6 @@ class SyncEventTest(SmartminTest):
 
         # we shouldn't update country once the relayer is claimed
         self.assertEqual("RW", self.tel_channel.country)
-
-
-class ChannelSyncTest(TembaTest):
-    @patch("temba.channels.models.Channel.trigger_sync")
-    def test_sync_old_seen_chaanels(self, mock_trigger_sync):
-        self.channel.last_seen = timezone.now() - timedelta(days=40)
-        self.channel.save()
-
-        sync_old_seen_channels()
-        self.assertFalse(mock_trigger_sync.called)
-
-        self.channel.last_seen = timezone.now() - timedelta(minutes=5)
-        self.channel.save()
-
-        sync_old_seen_channels()
-        self.assertFalse(mock_trigger_sync.called)
-
-        self.channel.last_seen = timezone.now() - timedelta(hours=3)
-        self.channel.save()
-
-        sync_old_seen_channels()
-        self.assertTrue(mock_trigger_sync.called)
 
 
 class ChannelIncidentsTest(TembaTest):

@@ -26,7 +26,7 @@ from django.contrib.postgres.validators import ArrayMinLengthValidator
 from django.core.files import File
 from django.core.files.storage import default_storage
 from django.db import models, transaction
-from django.db.models import Prefetch
+from django.db.models import Count, Prefetch
 from django.db.models.signals import post_save
 from django.dispatch import receiver
 from django.utils import timezone
@@ -60,6 +60,10 @@ class DependencyMixin:
 
     def get_dependents(self):
         return {"flow": self.dependent_flows.filter(is_active=True)}
+
+    @classmethod
+    def annotate_usage(cls, queryset):
+        return queryset.annotate(usage_count=Count("dependent_flows", distinct=True))
 
     def release(self, user):
         """
@@ -144,6 +148,8 @@ class User(AuthUser):
 
     @classmethod
     def create(cls, email: str, first_name: str, last_name: str, password: str, language: str = None):
+        assert not cls.get_by_email(email), "user with this email already exists"
+
         obj = cls.objects.create_user(
             username=email, email=email, first_name=first_name, last_name=last_name, password=password
         )
@@ -154,7 +160,7 @@ class User(AuthUser):
 
     @classmethod
     def get_or_create(cls, email: str, first_name: str, last_name: str, password: str, language: str = None):
-        obj = cls.objects.filter(username__iexact=email).first()
+        obj = cls.get_by_email(email)
         if obj:
             obj.first_name = first_name
             obj.last_name = last_name
@@ -162,6 +168,10 @@ class User(AuthUser):
             return obj
 
         return cls.create(email, first_name, last_name, password=password, language=language)
+
+    @classmethod
+    def get_by_email(cls, email: str):
+        return cls.objects.filter(username__iexact=email).first()
 
     @classmethod
     def get_orgs_for_request(cls, request):
@@ -354,7 +364,6 @@ class OrgRole(Enum):
     EDITOR = ("E", _("Editor"), _("Editors"), "Editors", "msgs.msg_inbox")
     VIEWER = ("V", _("Viewer"), _("Viewers"), "Viewers", "msgs.msg_inbox")
     AGENT = ("T", _("Agent"), _("Agents"), "Agents", "tickets.ticket_list")
-    SURVEYOR = ("S", _("Surveyor"), _("Surveyors"), "Surveyors", "users.login")
 
     def __init__(self, code: str, display: str, display_plural: str, group_name: str, start_view: str):
         self.code = code
@@ -454,12 +463,10 @@ class Org(SmartModel):
     CURRENT_EXPORT_VERSION = "13"
 
     FEATURE_USERS = "users"  # can invite users to this org
-    FEATURE_VIEWERS = "viewers"  # users with read-only Viewer role
     FEATURE_NEW_ORGS = "new_orgs"  # can create new workspace with same login
     FEATURE_CHILD_ORGS = "child_orgs"  # can create child workspaces of this org
     FEATURES_CHOICES = (
         (FEATURE_USERS, _("Users")),
-        (FEATURE_VIEWERS, _("Viewers")),
         (FEATURE_NEW_ORGS, _("New Orgs")),
         (FEATURE_CHILD_ORGS, _("Child Orgs")),
     )
@@ -510,6 +517,7 @@ class Org(SmartModel):
     flow_languages = ArrayField(models.CharField(max_length=3), default=list, validators=[ArrayMinLengthValidator(1)])
     input_collation = models.CharField(max_length=32, choices=COLLATION_CHOICES, default=COLLATION_DEFAULT)
     flow_smtp = models.CharField(null=True)  # e.g. smtp://...
+    prometheus_token = models.CharField(null=True, max_length=40)
 
     config = models.JSONField(default=dict)
     slug = models.SlugField(
@@ -530,10 +538,6 @@ class Org(SmartModel):
     )
     is_flagged = models.BooleanField(default=False, help_text=_("Whether this organization is currently flagged."))
     is_suspended = models.BooleanField(default=False, help_text=_("Whether this organization is currently suspended."))
-
-    surveyor_password = models.CharField(
-        null=True, max_length=128, default=None, help_text=_("A password that allows users to register as surveyors")
-    )
 
     # when this org was released and when it was actually deleted
     released_on = models.DateTimeField(null=True)
@@ -766,7 +770,7 @@ class Org(SmartModel):
 
         # with all the flows and dependencies committed, we can now have mailroom do full validation
         for flow in new_flows:
-            flow_info = mailroom.get_client().flow_inspect(self.id, flow.get_definition())
+            flow_info = mailroom.get_client().flow_inspect(self, flow.get_definition())
             flow.has_issues = len(flow_info[Flow.INSPECT_ISSUES]) > 0
             flow.save(update_fields=("has_issues",))
 
@@ -993,20 +997,6 @@ class Org(SmartModel):
         format = formats[1] if show_time else formats[0]
         return datetime_to_str(d, format, self.timezone)
 
-    def get_allowed_user_roles(self) -> list[OrgRole]:
-        """
-        Gets the allowed user roles which always includes any roles in use (can't take away roles).
-        """
-        roles = [r for r in OrgRole]
-        codes_in_use = set(OrgMembership.objects.filter(org=self).values_list("role_code", flat=True).distinct())
-
-        if "surveyor" not in settings.FEATURES and OrgRole.SURVEYOR.code not in codes_in_use:
-            roles.remove(OrgRole.SURVEYOR)
-        if Org.FEATURE_VIEWERS not in self.features and OrgRole.VIEWER.code not in codes_in_use:
-            roles.remove(OrgRole.VIEWER)
-
-        return roles
-
     def get_users(self, *, roles: list = None, with_perm: str = None):
         """
         Gets users in this org, filtered by role or permission.
@@ -1040,6 +1030,9 @@ class Org(SmartModel):
         """
         Adds the given user to this org with the given role
         """
+
+        assert role in OrgRole, f"invalid role: {role}"
+
         if self.has_user(user):  # remove user from any existing roles
             self.remove_user(user)
 
@@ -1373,7 +1366,6 @@ class Org(SmartModel):
         self.modified_on = timezone.now()
         self.deleted_on = timezone.now()
         self.config = {}
-        self.surveyor_password = None
         self.save()
 
         return counts
@@ -1394,7 +1386,7 @@ class Org(SmartModel):
         }
 
     def __repr__(self):
-        return f'<Org: name="{self.name}">'
+        return f'<Org: id={self.id} name="{self.name}">'
 
     def __str__(self):
         return self.name
@@ -1809,3 +1801,6 @@ class Export(TembaUUIDMixin, models.Model):
             default_storage.delete(self.path)
 
         super().delete()
+
+    def __repr__(self):  # pragma: no cover
+        return f'<Export: id={self.id} type="{self.export_type}">'

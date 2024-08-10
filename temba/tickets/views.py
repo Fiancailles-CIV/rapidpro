@@ -1,10 +1,17 @@
 from datetime import timedelta
 
-from smartmin.views import SmartCRUDL, SmartListView, SmartTemplateView, SmartUpdateView
+from smartmin.views import (
+    SmartCreateView,
+    SmartCRUDL,
+    SmartDeleteView,
+    SmartListView,
+    SmartTemplateView,
+    SmartUpdateView,
+)
 
 from django import forms
 from django.db.models.aggregates import Max
-from django.http import Http404, JsonResponse
+from django.http import Http404, HttpResponseRedirect, JsonResponse
 from django.urls import reverse
 from django.utils import timezone
 from django.utils.functional import cached_property
@@ -33,23 +40,24 @@ from .models import (
 )
 
 
-class NoteForm(forms.ModelForm):
-    note = forms.CharField(
-        max_length=2048,
-        required=True,
-        widget=InputWidget({"hide_label": True, "textarea": True}),
-        help_text=_("Notes can only be seen by the support team"),
-    )
-
-    class Meta:
-        model = Ticket
-        fields = ("note",)
-
-
 class TopicCRUDL(SmartCRUDL):
     model = Topic
-    actions = ("update",)
+    actions = ("create", "update", "delete")
     slug_field = "uuid"
+
+    class Create(OrgPermsMixin, ComponentFormMixin, ModalMixin, SmartCreateView):
+        class TopicForm(forms.ModelForm):
+            class Meta:
+                model = Topic
+                fields = ("name",)
+
+        form_class = TopicForm
+        success_url = "hide"
+
+        def pre_save(self, obj):
+            obj = super().pre_save(obj)
+            obj.org = self.request.org
+            return obj
 
     class Update(OrgObjPermsMixin, ComponentFormMixin, ModalMixin, SmartUpdateView):
         class Form(forms.ModelForm):
@@ -75,6 +83,28 @@ class TopicCRUDL(SmartCRUDL):
         fields = ("name",)
         form_class = Form
 
+    class Delete(ModalMixin, OrgObjPermsMixin, SmartDeleteView):
+        default_template = "smartmin/delete_confirm.html"
+        submit_button_name = _("Delete")
+        slug_url_kwarg = "uuid"
+        fields = ("uuid",)
+        cancel_url = "@tickets.ticket_list"
+        redirect_url = "@tickets.ticket_list"
+
+        def get_context_data(self, **kwargs):
+            context = super().get_context_data(**kwargs)
+            context["has_tickets"] = self.object.tickets.exists()
+            return context
+
+        def post(self, request, *args, **kwargs):
+            self.get_object().release(self.request.user)
+            redirect_url = self.get_redirect_url()
+            return HttpResponseRedirect(redirect_url)
+
+        def get_redirect_url(self, **kwargs):
+            default_topic = self.get_object().org.topics.filter(is_default=True).first()
+            return f"/ticket/{str(default_topic.uuid)}/open/"
+
 
 class TicketCRUDL(SmartCRUDL):
     model = Ticket
@@ -85,14 +115,16 @@ class TicketCRUDL(SmartCRUDL):
             def __init__(self, **kwargs):
                 super().__init__(**kwargs)
 
-                self.fields["topic"].queryset = self.instance.org.topics.order_by("name")
+                self.fields["topic"].queryset = self.instance.org.topics.filter(is_active=True).order_by(
+                    "-is_system", "name"
+                )
 
             class Meta:
-                fields = ("topic", "body")
+                fields = ("topic",)
                 model = Ticket
 
         form_class = Form
-        fields = ("topic", "body")
+        fields = ("topic",)
         slug_url_kwarg = "uuid"
         success_url = "hide"
 
@@ -237,10 +269,15 @@ class TicketCRUDL(SmartCRUDL):
                 )
 
             menu.append(self.create_divider())
+            menu.append(self.create_modax_button(_("Export"), "tickets.ticket_export", icon="export"))
+            menu.append(
+                self.create_modax_button(_("New Topic"), "tickets.topic_create", icon="add", on_submit="refreshMenu()")
+            )
 
-            topics = list(org.topics.filter(is_active=True).order_by("name"))
+            menu.append(self.create_divider())
+
+            topics = list(org.topics.filter(is_active=True).order_by("-is_system", "name"))
             counts = TicketCount.get_by_topics(org, topics, Ticket.STATUS_OPEN)
-
             for topic in topics:
                 menu.append(
                     {
@@ -279,6 +316,7 @@ class TicketCRUDL(SmartCRUDL):
                 and isinstance(self.folder, TopicFolder)
                 and not self.folder.is_system
             ):
+
                 menu.add_modax(
                     _("Edit"),
                     "edit-topic",
@@ -287,10 +325,11 @@ class TicketCRUDL(SmartCRUDL):
                     on_submit="handleTopicUpdated()",
                 )
 
-            if self.has_org_perm("tickets.ticket_export"):
-                menu.new_group()
                 menu.add_modax(
-                    _("Export"), "export-tickets", f"{reverse('tickets.ticket_export')}", title=_("Export Tickets")
+                    _("Delete"),
+                    "delete-topic",
+                    f"{reverse('tickets.topic_delete', args=[self.folder.id])}",
+                    title=_("Delete"),
                 )
 
         def get_queryset(self, **kwargs):
@@ -347,9 +386,7 @@ class TicketCRUDL(SmartCRUDL):
             # get the last message for each contact that these tickets belong to
             contact_ids = {t.contact_id for t in tickets}
             last_msg_ids = Msg.objects.filter(contact_id__in=contact_ids).values("contact").annotate(last_msg=Max("id"))
-            last_msgs = Msg.objects.filter(id__in=[m["last_msg"] for m in last_msg_ids]).select_related(
-                "created_by", "broadcast__created_by"  # TODO remove broadcast__created_by once msgs have created_by
-            )
+            last_msgs = Msg.objects.filter(id__in=[m["last_msg"] for m in last_msg_ids]).select_related("created_by")
 
             context["last_msgs"] = {m.contact: m for m in last_msgs}
             return context
@@ -362,18 +399,12 @@ class TicketCRUDL(SmartCRUDL):
                 return {"id": u.id, "first_name": u.first_name, "last_name": u.last_name, "email": u.email}
 
             def msg_as_json(m):
-                sender = None
-                if m.created_by:
-                    sender = {"id": m.created_by.id, "email": m.created_by.email}
-                elif m.broadcast and m.broadcast.created_by:
-                    sender = {"id": m.broadcast.created_by.id, "email": m.broadcast.created_by.email}
-
                 return {
                     "text": m.text,
                     "direction": m.direction,
                     "type": m.msg_type,
                     "created_on": m.created_on,
-                    "sender": sender,
+                    "sender": {"id": m.created_by.id, "email": m.created_by.email} if m.created_by else None,
                     "attachments": m.attachments,
                 }
 
@@ -391,7 +422,6 @@ class TicketCRUDL(SmartCRUDL):
                         "uuid": str(t.uuid),
                         "assignee": user_as_json(t.assignee) if t.assignee else None,
                         "topic": topic_as_json(t.topic) if t.topic else None,
-                        "body": t.body,
                         "last_activity_on": t.last_activity_on,
                         "closed_on": t.closed_on,
                     },
@@ -414,11 +444,22 @@ class TicketCRUDL(SmartCRUDL):
         Creates a note for this contact
         """
 
-        form_class = NoteForm
+        class Form(forms.ModelForm):
+            note = forms.CharField(
+                max_length=Ticket.MAX_NOTE_LENGTH,
+                required=True,
+                widget=InputWidget({"hide_label": True, "textarea": True}),
+                help_text=_("Notes can only be seen by the support team"),
+            )
+
+            class Meta:
+                model = Ticket
+                fields = ("note",)
+
+        form_class = Form
         fields = ("note",)
         success_url = "hide"
         slug_url_kwarg = "uuid"
-        submit_button_name = _("Save")
 
         def form_valid(self, form):
             self.get_object().add_note(self.request.user, note=form.cleaned_data["note"])

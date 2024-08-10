@@ -16,7 +16,7 @@ from temba.archives.models import Archive
 from temba.campaigns.models import Campaign, CampaignEvent
 from temba.channels.models import Channel, ChannelEvent
 from temba.classifiers.models import Classifier
-from temba.contacts.models import Contact, ContactField, ContactGroup, ContactGroupCount, ContactURN
+from temba.contacts.models import Contact, ContactField, ContactGroup, ContactGroupCount, ContactNote, ContactURN
 from temba.flows.models import Flow, FlowRun, FlowStart
 from temba.globals.models import Global
 from temba.locations.models import AdminBoundary, BoundaryAlias
@@ -1339,6 +1339,8 @@ class ContactsEndpoint(ListAPIMixin, WriteAPIMixin, DeleteAPIMixin, BaseEndpoint
                 to_attr="prefetched_groups",
             ),
             Prefetch("current_flow"),
+            Prefetch("notes", queryset=ContactNote.objects.order_by("id")),
+            Prefetch("notes__created_by"),
         )
 
         return self.filter_before_after(queryset, "modified_on")
@@ -3273,7 +3275,6 @@ class TicketsEndpoint(ListAPIMixin, BaseEndpoint):
      * **status** - the status of the ticket, either `open` or `closed`.
      * **topic** - the topic of the ticket (object).
      * **assignee** - the user assigned to the ticket (object).
-     * **body** - the body of the ticket (string).
      * **opened_on** - when this ticket was opened (datetime).
      * **opened_by** - the user who opened the ticket (object).
      * **opened_in** - the flow which opened the ticket (object).
@@ -3296,7 +3297,6 @@ class TicketsEndpoint(ListAPIMixin, BaseEndpoint):
                 "status": "open",
                 "topic": {"uuid": "040edbfe-be55-48f3-864d-a4a7147c447b", "name": "Support"},
                 "assignee": {"email": "bob@flow.com", "name": "Bob McFlow"},
-                "body": "Where did I leave my shorts?",
                 "opened_on": "2013-02-27T09:06:15.456",
                 "opened_by": null,
                 "opened_in": {"uuid": "54cd8e2c-6334-49a4-abf9-f0fa8d0971da", "name": "Support Flow"},
@@ -3456,6 +3456,9 @@ class TopicsEndpoint(ListAPIMixin, WriteAPIMixin, BaseEndpoint):
     serializer_class = TopicReadSerializer
     write_serializer_class = TopicWriteSerializer
     pagination_class = CreatedOnCursorPagination
+
+    def get_queryset(self):
+        return super().get_queryset().filter(is_active=True)
 
     def prepare_for_serialization(self, object_list, using: str):
         open_counts = TicketCount.get_by_topics(self.request.org, object_list, Ticket.STATUS_OPEN)

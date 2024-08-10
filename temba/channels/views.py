@@ -68,7 +68,7 @@ class ChannelTypeMixin(SpaMixin):
 
 class ClaimViewMixin(ChannelTypeMixin, OrgPermsMixin, ComponentFormMixin):
     permission = "channels.channel_claim"
-    menu_path = "/settings/workspace"
+    menu_path = "/settings/channels/new-channel"
 
     class Form(forms.Form):
         def __init__(self, **kwargs):
@@ -496,6 +496,9 @@ class ChannelCRUDL(SmartCRUDL):
 
             menu.add_link(_("Logs"), reverse("channels.channellog_list", args=[obj.uuid]))
 
+            if obj.type.template_type:
+                menu.add_link(_("Template Logs"), reverse("request_logs.httplog_channel", args=[obj.uuid]))
+
             if self.has_org_perm("channels.channel_update"):
                 menu.add_modax(
                     _("Edit"),
@@ -521,7 +524,7 @@ class ChannelCRUDL(SmartCRUDL):
             context["msg_count"] = channel.get_msg_count()
             context["ivr_count"] = channel.get_ivr_count()
 
-            if channel.is_android():
+            if channel.is_android:
                 context["latest_sync_events"] = channel.sync_events.order_by("-created_on")[:10]
 
             if not channel.is_new():
@@ -730,8 +733,6 @@ class ChannelCRUDL(SmartCRUDL):
             return response
 
     class Update(OrgObjPermsMixin, ComponentFormMixin, ModalMixin, SmartUpdateView):
-        submit_button_name = _("Save Changes")
-
         def derive_title(self):
             return _("%s Channel") % self.object.type.name
 
@@ -758,7 +759,7 @@ class ChannelCRUDL(SmartCRUDL):
 
     class Claim(SpaMixin, OrgPermsMixin, SmartTemplateView):
         title = _("New Channel")
-        menu_path = "/settings/workspace"
+        menu_path = "/settings/channels/new-channel"
 
         def channel_types_groups(self):
             org = self.request.org

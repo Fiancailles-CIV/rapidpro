@@ -16,7 +16,7 @@ from temba.archives.models import Archive
 from temba.campaigns.models import Campaign, CampaignEvent
 from temba.channels.models import Channel, ChannelEvent
 from temba.classifiers.models import Classifier
-from temba.contacts.models import URN, Contact, ContactField, ContactGroup, ContactURN
+from temba.contacts.models import URN, Contact, ContactField, ContactGroup, ContactNote, ContactURN
 from temba.flows.models import Flow, FlowRun, FlowStart
 from temba.globals.models import Global
 from temba.locations.models import AdminBoundary
@@ -24,7 +24,7 @@ from temba.mailroom import modifiers
 from temba.msgs.models import Broadcast, Label, Media, Msg, OptIn
 from temba.orgs.models import Org, OrgRole
 from temba.tickets.models import Ticket, Topic
-from temba.utils import json, on_transaction_commit
+from temba.utils import json
 from temba.utils.fields import NameValidator
 
 from ..models import BulkActionFailure, Resthook, ResthookSubscriber, WebHookEvent
@@ -250,19 +250,18 @@ class BroadcastWriteSerializer(WriteSerializer):
                 # TODO update broadcast sending to allow media objects to stay as UUIDs for longer
                 translations[lang]["attachments"] = [str(m) for m in atts]
 
-        broadcast = Broadcast.create(
+        if not base_language:
+            base_language = next(iter(translations))
+
+        return Broadcast.create(
             self.context["org"],
             self.context["user"],
-            translations=translations,
+            translations,
             base_language=base_language,
             groups=self.validated_data.get("groups", []),
             contacts=self.validated_data.get("contacts", []),
             urns=self.validated_data.get("urns", []),
         )
-
-        on_transaction_commit(lambda: broadcast.send_async())
-
-        return broadcast
 
 
 class ChannelEventReadSerializer(ReadSerializer):
@@ -472,7 +471,7 @@ class ChannelReadSerializer(ReadSerializer):
         return str(obj.country) if obj.country else None
 
     def get_device(self, obj):
-        if not obj.is_android():
+        if not obj.is_android:
             return None
 
         return {
@@ -519,6 +518,7 @@ class ContactReadSerializer(ReadSerializer):
     urns = serializers.SerializerMethodField()
     groups = serializers.SerializerMethodField()
     fields = serializers.SerializerMethodField("get_contact_fields")
+    notes = serializers.SerializerMethodField()
     created_on = serializers.DateTimeField(default_timezone=tzone.utc)
     modified_on = serializers.DateTimeField(default_timezone=tzone.utc)
     last_seen_on = serializers.DateTimeField(default_timezone=tzone.utc)
@@ -557,6 +557,18 @@ class ContactReadSerializer(ReadSerializer):
         groups = obj.prefetched_groups if hasattr(obj, "prefetched_groups") else obj.get_groups()
         return [{"uuid": g.uuid, "name": g.name} for g in groups]
 
+    def get_notes(self, obj):
+        if not obj.is_active:
+            return []
+        return [
+            {
+                "text": note.text,
+                "created_on": note.created_on,
+                "created_by": {"email": note.created_by.email, "name": note.created_by.name},
+            }
+            for note in obj.notes.all()
+        ]
+
     def get_contact_fields(self, obj):
         if not obj.is_active:
             return {}
@@ -582,6 +594,7 @@ class ContactReadSerializer(ReadSerializer):
             "language",
             "urns",
             "groups",
+            "notes",
             "fields",
             "flow",
             "created_on",
@@ -595,6 +608,7 @@ class ContactReadSerializer(ReadSerializer):
 class ContactWriteSerializer(WriteSerializer):
     name = serializers.CharField(required=False, max_length=64, allow_null=True)
     language = serializers.CharField(required=False, min_length=3, max_length=3, allow_null=True)
+    note = serializers.CharField(required=False, max_length=ContactNote.MAX_LENGTH, allow_blank=True)
     urns = serializers.ListField(required=False, child=fields.URNField(), max_length=100)
     groups = fields.ContactGroupField(many=True, required=False, allow_dynamic=False)
     fields = fields.LimitedDictField(
@@ -669,6 +683,7 @@ class ContactWriteSerializer(WriteSerializer):
         urns = self.validated_data.get("urns")
         groups = self.validated_data.get("groups")
         custom_fields = self.validated_data.get("fields")
+        note = self.validated_data.get("note")
 
         mods = []
 
@@ -694,16 +709,20 @@ class ContactWriteSerializer(WriteSerializer):
             if mods:
                 self.instance.modify(self.context["user"], mods)
 
+            if note is not None:
+                self.instance.set_note(self.context["user"], note)
+
         # create new contact
         else:
             self.instance = Contact.create(
                 self.context["org"],
                 self.context["user"],
-                name,
-                language,
-                urns or [],
-                custom_fields or {},
-                groups or [],
+                name=name,
+                language=language,
+                status=Contact.STATUS_ACTIVE,
+                urns=urns or [],
+                fields=custom_fields or {},
+                groups=groups or [],
             )
 
         return self.instance
@@ -1365,9 +1384,7 @@ class MsgWriteSerializer(WriteSerializer):
         attachments = [str(m) for m in self.validated_data.get("attachments", [])]
         ticket = self.validated_data.get("ticket")
 
-        resp = mailroom.get_client().msg_send(
-            org.id, user.id, contact.id, text or "", attachments, ticket.id if ticket else None
-        )
+        resp = mailroom.get_client().msg_send(org, user, contact, text or "", attachments, ticket)
 
         # to avoid fetching the new msg from the database, construct transient instances to pass to the serializer
         channel = Channel(uuid=resp["channel"]["uuid"], name=resp["channel"]["name"]) if resp.get("channel") else None
@@ -1579,9 +1596,13 @@ class TicketReadSerializer(ReadSerializer):
     opened_in = fields.FlowField()
     modified_on = serializers.DateTimeField(default_timezone=tzone.utc)
     closed_on = serializers.DateTimeField(default_timezone=tzone.utc)
+    body = serializers.SerializerMethodField()  # deprecated
 
     def get_status(self, obj):
         return self.STATUSES.get(obj.status)
+
+    def get_body(self, obj):
+        return None
 
     class Meta:
         model = Ticket
@@ -1612,7 +1633,7 @@ class TicketBulkActionSerializer(WriteSerializer):
     action = serializers.ChoiceField(required=True, choices=ACTION_CHOICES)
     assignee = fields.UserField(required=False, allow_null=True, assignable_only=True)
     topic = fields.TopicField(required=False)
-    note = serializers.CharField(required=False, max_length=Ticket.MAX_NOTE_LEN)
+    note = serializers.CharField(required=False, max_length=Ticket.MAX_NOTE_LENGTH)
 
     def validate(self, data):
         action = data["action"]
@@ -1690,7 +1711,6 @@ class UserReadSerializer(ReadSerializer):
         OrgRole.EDITOR: "editor",
         OrgRole.VIEWER: "viewer",
         OrgRole.AGENT: "agent",
-        OrgRole.SURVEYOR: "surveyor",
     }
 
     avatar = serializers.SerializerMethodField()

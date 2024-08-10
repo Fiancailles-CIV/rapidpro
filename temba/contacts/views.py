@@ -51,10 +51,9 @@ from temba.utils.models import patch_queryset_count
 from temba.utils.models.es import IDSliceQuerySet
 from temba.utils.views import BulkActionMixin, ComponentFormMixin, ContentMenuMixin, NonAtomicMixin, SpaMixin
 
-from .forms import ContactGroupForm, UpdateContactForm
+from .forms import ContactGroupForm, CreateContactForm, UpdateContactForm
 from .models import URN, Contact, ContactExport, ContactField, ContactGroup, ContactGroupCount, ContactImport
-from .search import parse_query, search_contacts
-from .search.omnibox import omnibox_query, omnibox_results_to_dict
+from .omnibox import omnibox_query, omnibox_serialize
 
 logger = logging.getLogger(__name__)
 
@@ -65,12 +64,6 @@ HISTORY_INCLUDE_EVENTS = {
     Event.TYPE_CONTACT_GROUPS_CHANGED,
     Event.TYPE_CONTACT_NAME_CHANGED,
     Event.TYPE_CONTACT_URNS_CHANGED,
-    Event.TYPE_EMAIL_SENT,
-    Event.TYPE_ERROR,
-    Event.TYPE_FAILURE,
-    Event.TYPE_INPUT_LABELS_ADDED,
-    Event.TYPE_RUN_RESULT_CHANGED,
-    Event.TYPE_WEBHOOK_CALLED,
 }
 
 
@@ -144,8 +137,8 @@ class ContactListView(SpaMixin, OrgPermsMixin, BulkActionMixin, SmartListView):
                 exclude_ids = []
 
             try:
-                results = search_contacts(
-                    org, search_query, group=self.group, sort=sort_on, offset=offset, exclude_ids=exclude_ids
+                results = mailroom.get_client().contact_search(
+                    org, self.group, search_query, sort=sort_on, offset=offset, exclude_ids=exclude_ids
                 )
                 self.parsed_query = results.query if len(results.query) > 0 else None
                 self.save_dynamic_search = results.metadata.allow_as_group
@@ -306,8 +299,8 @@ class ContactCRUDL(SmartCRUDL):
                 return blocker
 
             query = self.request.GET.get("s")
-            preview = mailroom.get_client().contact_export_preview(self.request.org.id, self.group.id, query)
-            if preview["total"] > self.size_limit:
+            total = mailroom.get_client().contact_export_preview(self.request.org, self.group, query)
+            if total > self.size_limit:
                 return "too-big"
 
             return ""
@@ -324,23 +317,15 @@ class ContactCRUDL(SmartCRUDL):
             return ContactExport.create(org, user, group=self.group, search=search, with_groups=with_groups)
 
     class Omnibox(OrgPermsMixin, SmartListView):
-        paginate_by = 75
-        fields = ("id", "text")
-
         def get_queryset(self, **kwargs):
-            org = self.derive_org()
-            return omnibox_query(org, **{k: v for k, v in self.request.GET.items()})
+            return Contact.objects.none()
 
         def render_to_response(self, context, **response_kwargs):
-            org = self.derive_org()
-            page = context["page_obj"]
-            object_list = context["object_list"]
+            org = self.request.org
+            groups, contacts = omnibox_query(org, **{k: v for k, v in self.request.GET.items()})
+            results = omnibox_serialize(org, groups, contacts)
 
-            results = omnibox_results_to_dict(org, object_list)
-
-            json_result = {"results": results, "more": page.has_next(), "total": len(results), "err": "nil"}
-
-            return HttpResponse(json.dumps(json_result), content_type="application/json")
+            return JsonResponse({"results": results, "more": False, "total": len(results), "err": "nil"})
 
     class Read(SpaMixin, OrgObjPermsMixin, ContentMenuMixin, SmartReadView):
         slug_url_kwarg = "uuid"
@@ -359,6 +344,16 @@ class ContactCRUDL(SmartCRUDL):
         def build_content_menu(self, menu):
             obj = self.get_object()
 
+            if self.has_org_perm("contacts.contact_update"):
+                menu.add_modax(
+                    _("Edit"),
+                    "edit-contact",
+                    f"{reverse('contacts.contact_update', args=[obj.id])}",
+                    title=_("Edit Contact"),
+                    on_submit="contactUpdated()",
+                    as_button=True,
+                )
+
             if obj.status == Contact.STATUS_ACTIVE:
                 if self.has_org_perm("flows.flow_start"):
                     menu.add_modax(
@@ -372,20 +367,8 @@ class ContactCRUDL(SmartCRUDL):
                     menu.add_modax(
                         _("Open Ticket"), "open-ticket", reverse("contacts.contact_open_ticket", args=[obj.id])
                     )
-
-                menu.new_group()
-
                 if self.has_org_perm("contacts.contact_interrupt") and obj.current_flow:
                     menu.add_url_post(_("Interrupt"), reverse("contacts.contact_interrupt", args=(obj.id,)))
-
-            if self.has_org_perm("contacts.contact_update"):
-                menu.add_modax(
-                    _("Edit"),
-                    "edit-contact",
-                    f"{reverse('contacts.contact_update', args=[obj.id])}",
-                    title=_("Edit Contact"),
-                    on_submit="contactUpdated()",
-                )
 
     class Scheduled(OrgObjPermsMixin, SmartReadView):
         """
@@ -490,7 +473,9 @@ class ContactCRUDL(SmartCRUDL):
                 return JsonResponse({"total": 0, "sample": [], "fields": {}})
 
             try:
-                results = search_contacts(org, query, group=org.active_contacts_group, sort="-created_on")
+                results = mailroom.get_client().contact_search(
+                    org, org.active_contacts_group, query, sort="-created_on"
+                )
                 summary = {
                     "total": results.total,
                     "query": results.query,
@@ -550,7 +535,7 @@ class ContactCRUDL(SmartCRUDL):
 
             if has_contactgroup_create_perm and valid_search_condition:
                 try:
-                    parsed = parse_query(self.request.org, search)
+                    parsed = mailroom.get_client().contact_parse_query(self.request.org, search)
                     if parsed.metadata.allow_as_group:
                         menu.add_modax(
                             _("Create Smart Group"),
@@ -696,16 +681,13 @@ class ContactCRUDL(SmartCRUDL):
                 raise Http404("Group not found")
 
     class Create(NonAtomicMixin, ModalMixin, OrgPermsMixin, SmartCreateView):
-        class Form(forms.ModelForm):
-            phone = forms.CharField(required=False, max_length=255, label=_("Phone Number"), widget=InputWidget())
-
-            class Meta:
-                model = Contact
-                fields = ("name", "phone")
-                widgets = {"name": InputWidget(attrs={"widget_only": False})}
-
-        form_class = Form
+        form_class = CreateContactForm
         submit_button_name = _("Create")
+
+        def get_form_kwargs(self, *args, **kwargs):
+            kwargs = super().get_form_kwargs(*args, **kwargs)
+            kwargs["org"] = self.request.org
+            return kwargs
 
         def form_valid(self, form):
             name = self.form.cleaned_data.get("name")
@@ -713,8 +695,17 @@ class ContactCRUDL(SmartCRUDL):
             urns = ["tel:" + phone] if phone else []
 
             try:
-                Contact.create(self.request.org, self.request.user, name, language="", urns=urns, fields={}, groups=[])
-            except mailroom.URNValidationException as e:
+                Contact.create(
+                    self.request.org,
+                    self.request.user,
+                    name=name,
+                    language="",
+                    status=Contact.STATUS_ACTIVE,
+                    urns=urns,
+                    fields={},
+                    groups=[],
+                )
+            except mailroom.URNValidationException as e:  # pragma: needs cover
                 error = _("In use by another contact.") if e.code == "taken" else _("Not a valid phone number.")
                 self.form.add_error("phone", error)
                 return self.form_invalid(form)
@@ -724,7 +715,6 @@ class ContactCRUDL(SmartCRUDL):
     class Update(SpaMixin, ComponentFormMixin, NonAtomicMixin, ModalMixin, OrgObjPermsMixin, SmartUpdateView):
         form_class = UpdateContactForm
         success_url = "hide"
-        submit_button_name = _("Save Changes")
 
         def derive_exclude(self):
             obj = self.get_object()
@@ -737,9 +727,9 @@ class ContactCRUDL(SmartCRUDL):
             return exclude
 
         def get_form_kwargs(self, *args, **kwargs):
-            form_kwargs = super().get_form_kwargs(*args, **kwargs)
-            form_kwargs["org"] = self.request.org
-            return form_kwargs
+            kwargs = super().get_form_kwargs(*args, **kwargs)
+            kwargs["org"] = self.request.org
+            return kwargs
 
         def get_context_data(self, **kwargs):
             context = super().get_context_data(**kwargs)
@@ -807,17 +797,17 @@ class ContactCRUDL(SmartCRUDL):
 
         class Form(forms.Form):
             topic = forms.ModelChoiceField(queryset=Topic.objects.none(), label=_("Topic"), required=True)
-            body = forms.CharField(
-                label=_("Body"),
-                widget=InputWidget(attrs={"textarea": True, "placeholder": _("Optional")}),
-                required=False,
-            )
             assignee = forms.ModelChoiceField(
                 queryset=User.objects.none(),
                 label=_("Assignee"),
                 widget=SelectWidget(),
                 required=False,
                 empty_label=_("Unassigned"),
+            )
+            note = forms.CharField(
+                label=_("Note"),
+                widget=InputWidget(attrs={"textarea": True, "placeholder": _("Optional")}),
+                required=False,
             )
 
             def __init__(self, instance, org, **kwargs):
@@ -837,9 +827,9 @@ class ContactCRUDL(SmartCRUDL):
         def save(self, obj):
             self.ticket = obj.open_ticket(
                 self.request.user,
-                self.form.cleaned_data["topic"],
-                self.form.cleaned_data.get("body"),
+                topic=self.form.cleaned_data["topic"],
                 assignee=self.form.cleaned_data.get("assignee"),
+                note=self.form.cleaned_data.get("note"),
             )
 
         def get_success_url(self):
@@ -1143,12 +1133,14 @@ class ContactFieldCRUDL(SmartCRUDL):
         default_order = "name"
 
         def build_content_menu(self, menu):
-            menu.add_modax(
-                _("New Field"),
-                "new-field",
-                f"{reverse('contacts.contactfield_create')}",
-                on_submit="handleFieldUpdated()",
-            )
+            if self.has_org_perm("contacts.contactfield_create"):
+                menu.add_modax(
+                    _("New Field"),
+                    "new-field",
+                    f"{reverse('contacts.contactfield_create')}",
+                    on_submit="handleFieldUpdated()",
+                    as_button=True,
+                )
 
         def get_queryset(self, **kwargs):
             return super().get_queryset(**kwargs).filter(org=self.request.org, is_active=True, is_system=False)

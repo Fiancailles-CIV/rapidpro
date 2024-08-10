@@ -28,11 +28,18 @@ from temba.ivr.models import Call
 from temba.locations.models import AdminBoundary, BoundaryAlias
 from temba.msgs.models import Broadcast, Label, Msg, OptIn
 from temba.orgs.models import Org, OrgRole, User
+from temba.templates.models import Template
 from temba.tickets.models import Ticket, TicketEvent
 from temba.utils import json
 from temba.utils.uuid import UUID, uuid4
 
-from .mailroom import contact_urn_lookup, create_contact_locally, resolve_destination, update_field_locally
+from .mailroom import (
+    contact_urn_lookup,
+    create_broadcast,
+    create_contact_locally,
+    resolve_destination,
+    update_field_locally,
+)
 from .s3 import jsonlgz_encode
 
 
@@ -63,7 +70,6 @@ class TembaTest(SmartminTest):
         self.editor = self.create_user("editor@nyaruka.com", first_name="Ed", last_name="McEdits")
         self.user = self.create_user("viewer@nyaruka.com")
         self.agent = self.create_user("agent@nyaruka.com", first_name="Agnes")
-        self.surveyor = self.create_user("surveyor@nyaruka.com")
         self.customer_support = self.create_user("support@nyaruka.com", is_staff=True)
 
         self.org = Org.objects.create(
@@ -78,7 +84,6 @@ class TembaTest(SmartminTest):
         self.org.add_user(self.editor, OrgRole.EDITOR)
         self.org.add_user(self.user, OrgRole.VIEWER)
         self.org.add_user(self.agent, OrgRole.AGENT)
-        self.org.add_user(self.surveyor, OrgRole.SURVEYOR)
 
         # setup a second org with a single admin
         self.admin2 = self.create_user("administrator@trileet.com")
@@ -135,6 +140,7 @@ class TembaTest(SmartminTest):
         self.ward3 = AdminBoundary.create(osm_id="VMN.49.1_1", name="Bukure", level=3, parent=self.district4)
 
         BoundaryAlias.create(self.org, self.admin, self.state1, "Kigari")
+        BoundaryAlias.create(self.org2, self.admin2, self.state1, "Chigali")
 
         self.country.update_path()
 
@@ -436,6 +442,7 @@ class TembaTest(SmartminTest):
             status=status or (Msg.STATUS_PENDING if direction == Msg.DIRECTION_IN else Msg.STATUS_INITIALIZING),
             msg_type=msg_type,
             visibility=visibility,
+            is_android=channel and channel.is_android,
             external_id=external_id,
             high_priority=high_priority,
             created_on=created_on or timezone.now(),
@@ -452,26 +459,15 @@ class TembaTest(SmartminTest):
             log_uuids=[l.uuid for l in logs or []],
         )
 
-    def create_translations(self, text="", attachments=[], lang="und", optin=None):
-        translations = {
-            lang: {
-                "text": text,
-                "attachments": attachments,
-                "quick_replies": [],
-            }
-        }
-
-        if optin:
-            translations[lang]["optin"] = {"uuid": str(optin.uuid), "name": optin.name} if optin else None
-        return translations
-
     def create_broadcast(
         self,
         user,
-        translations: dict[str, list] | str,
-        contacts=(),
+        translations: dict[str, dict],
         groups=(),
+        contacts=(),
+        urns=(),
         optin=None,
+        exclude=None,
         status=Broadcast.STATUS_SENT,
         msg_status=Msg.STATUS_SENT,
         parent=None,
@@ -479,27 +475,43 @@ class TembaTest(SmartminTest):
         created_on=None,
         org=None,
     ):
-        if isinstance(translations, str):
-            translations = self.create_translations(translations)
-
-        bcast = Broadcast.create(
+        bcast = create_broadcast(
             org or self.org,
             user,
             translations=translations,
-            contacts=contacts,
+            base_language=next(iter(translations)),
             groups=groups,
+            contacts=contacts,
+            urns=urns,
+            query=None,
+            node_uuid=None,
+            exclude=exclude,
             optin=optin,
-            parent=parent,
+            template=None,
+            template_variables=None,
             schedule=schedule,
-            created_on=created_on or timezone.now(),
-            status=status,
         )
+
+        update_fields = []
+
+        if bcast.status != status:
+            bcast.status = status
+            update_fields.append("status")
+        if parent:
+            bcast.parent = parent
+            update_fields.append("parent")
+        if created_on:
+            bcast.created_on = created_on
+            update_fields.append("created_on")
+
+        if update_fields:
+            bcast.save(update_fields=update_fields)
 
         contacts = set(bcast.contacts.all())
         for group in bcast.groups.all():
             contacts.update(group.contacts.all())
 
-        if not schedule:
+        if not schedule and status != Broadcast.STATUS_QUEUED:
             for contact in contacts:
                 translation = bcast.get_translation(contact)
                 self._create_msg(
@@ -709,12 +721,28 @@ class TembaTest(SmartminTest):
             extra=extra,
         )
 
+    def create_template(self, name: str, translations: list, org=None, uuid=None):
+        template = Template.objects.create(
+            uuid=uuid or uuid4(),
+            org=org or self.org,
+            name=name,
+            created_by=self.admin,
+            modified_by=self.admin,
+        )
+        for trans in translations:
+            trans.template = template
+            trans.save()
+
+        template.update_base()
+
+        return template
+
     def create_ticket(
         self,
         contact,
-        body: str,
         topic=None,
         assignee=None,
+        note: str = None,
         opened_on=None,
         opened_by=None,
         opened_in=None,
@@ -728,7 +756,6 @@ class TembaTest(SmartminTest):
             org=contact.org,
             contact=contact,
             topic=topic or contact.org.default_ticket_topic,
-            body=body,
             status=Ticket.STATUS_CLOSED if closed_on else Ticket.STATUS_OPEN,
             assignee=assignee,
             opened_on=opened_on,
@@ -742,6 +769,7 @@ class TembaTest(SmartminTest):
             ticket=ticket,
             event_type=TicketEvent.TYPE_OPENED,
             assignee=assignee,
+            note=note,
             created_by=opened_by,
             created_on=opened_on,
         )

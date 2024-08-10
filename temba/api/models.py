@@ -48,9 +48,6 @@ class APIPermission(BasePermission):
         codes that the user is required to have.
         """
 
-        if view.is_docs():  # no permission required to view docs
-            return None
-
         if hasattr(view, "permission"):
             return view.permission
 
@@ -63,37 +60,37 @@ class APIPermission(BasePermission):
         }
 
     def has_permission(self, request, view):
+        # viewing docs is always allowed
+        if view.is_docs():
+            return request.method == "GET"
+
         permission = self.get_required_permission(request, view)
 
-        if permission:
-            # no anon access to API endpoints
-            if request.user.is_anonymous:
+        # no anon access to API endpoints
+        if request.user.is_anonymous:
+            return False
+
+        org = request.org
+
+        if request.auth:
+            # check that user is still allowed to use the token's role
+            if not request.auth.is_valid():
                 return False
 
-            org = request.org
-
-            if request.auth:
-                # check that user is still allowed to use the token's role
-                if not request.auth.is_valid():
-                    return False
-
-                role = OrgRole.from_group(request.auth.role)
-            elif org:
-                # user may not have used token authentication
-                role = org.get_user_role(request.user)
-            else:
-                return False
-
-            has_perm = role.has_api_perm(permission)
-
-            # viewers can only ever get from the API
-            if role == OrgRole.VIEWER:
-                return has_perm and request.method == "GET"
-
-            return has_perm
-
+            role = OrgRole.from_group(request.auth.role)
+        elif org:
+            # user may not have used token authentication
+            role = org.get_user_role(request.user)
         else:
-            return True
+            return False
+
+        has_perm = role.has_api_perm(permission)
+
+        # viewers can only ever get from the API
+        if role == OrgRole.VIEWER:
+            return has_perm and request.method == "GET"
+
+        return has_perm
 
 
 class SSLPermission(BasePermission):  # pragma: no cover
@@ -213,8 +210,6 @@ class APIToken(models.Model):
     GROUP_GRANTED_TO = {
         "Administrators": (OrgRole.ADMINISTRATOR,),
         "Editors": (OrgRole.ADMINISTRATOR, OrgRole.EDITOR),
-        "Surveyors": (OrgRole.ADMINISTRATOR, OrgRole.EDITOR, OrgRole.SURVEYOR),
-        "Prometheus": (OrgRole.ADMINISTRATOR,),
     }
 
     org = models.ForeignKey(Org, on_delete=models.PROTECT, related_name="api_tokens")
@@ -225,18 +220,13 @@ class APIToken(models.Model):
     is_active = models.BooleanField(default=True)
 
     @classmethod
-    def get_or_create(cls, org, user, *, role: OrgRole = None, prometheus: bool = False, refresh: bool = False):
+    def get_or_create(cls, org, user, *, role: OrgRole = None, refresh: bool = False):
         """
         Gets or creates an API token for this user
         """
 
-        assert not (role and prometheus), "can't specify both org role and prometheus = true"
-
-        if prometheus:
-            role_group = Group.objects.get(name="Prometheus")
-        else:
-            role = role or cls.get_default_role(org, user)
-            role_group = role.group if role else None
+        role = role or cls.get_default_role(org, user)
+        role_group = role.group if role else None
 
         if not role_group:
             raise ValueError("User '%s' has no suitable role for API usage" % str(user))

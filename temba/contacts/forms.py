@@ -9,7 +9,34 @@ from temba.utils import languages
 from temba.utils.fields import InputWidget, SelectMultipleWidget, SelectWidget, TembaMultipleChoiceField
 
 from .models import URN, Contact, ContactGroup, ContactURN
-from .search import parse_query
+
+
+class CreateContactForm(forms.ModelForm):
+    phone = forms.CharField(required=False, max_length=64, label=_("Phone Number"), widget=InputWidget())
+
+    def __init__(self, org, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.org = org
+
+    def clean_phone(self):
+        phone = self.cleaned_data.get("phone")
+        if phone:
+            resolved = mailroom.get_client().contact_urns(self.org, ["tel:" + phone])[0]
+
+            if resolved.contact_id:
+                raise forms.ValidationError(_("In use by another contact."))
+            if resolved.error:
+                raise forms.ValidationError(_("Invalid phone number."))
+            if not resolved.e164:
+                raise forms.ValidationError(_("Ensure number includes country code."))
+
+        return phone
+
+    class Meta:
+        model = Contact
+        fields = ("name", "phone")
+        widgets = {"name": InputWidget(attrs={"widget_only": False})}
 
 
 class UpdateContactForm(forms.ModelForm):
@@ -94,7 +121,7 @@ class UpdateContactForm(forms.ModelForm):
         # let mailroom figure out which are valid or taken
         if urns_by_field:
             urn_values = list(urns_by_field.values())
-            resolved = mailroom.get_client().contact_urns(self.org.id, urn_values)
+            resolved = mailroom.get_client().contact_urns(self.org, urn_values)
             resolved_by_value = dict(zip(urn_values, resolved))
 
             for field, urn in urns_by_field.items():
@@ -104,11 +131,10 @@ class UpdateContactForm(forms.ModelForm):
                 if resolved.contact_id and resolved.contact_id != self.instance.id:
                     self.add_error(field, _("In use by another contact."))
                 elif resolved.error:
+                    self.add_error(field, _("Invalid format."))
+                elif scheme == URN.TEL_SCHEME and field == "new_path" and not resolved.e164:
                     # if a new phone numer is being added, it must have country code
-                    if scheme == URN.TEL_SCHEME and field == "new_path" and not resolved.e164:
-                        self.add_error(field, _("Invalid phone number. Ensure number includes country code."))
-                    else:
-                        self.add_error(field, _("Invalid format."))
+                    self.add_error(field, _("Invalid phone number. Ensure number includes country code."))
 
                 self.cleaned_data[field] = path
 
@@ -151,7 +177,7 @@ class ContactGroupForm(forms.ModelForm):
 
     def clean_query(self):
         try:
-            parsed = parse_query(self.org, self.cleaned_data["query"])
+            parsed = mailroom.get_client().contact_parse_query(self.org, self.cleaned_data["query"])
             if not parsed.metadata.allow_as_group:
                 raise forms.ValidationError(_('You cannot create a smart group based on "id" or "group".'))
 

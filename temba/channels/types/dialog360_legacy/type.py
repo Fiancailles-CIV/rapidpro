@@ -34,8 +34,6 @@ class Dialog360LegacyType(ChannelType):
 
     config_ui = ConfigUI()  # has own template
 
-    menu_items = [dict(label=_("Message Templates"), view_name="templates.templatetranslation_channel")]
-
     def get_headers(self, channel):
         return {"D360-API-KEY": channel.config[Channel.CONFIG_AUTH_TOKEN], "Content-Type": "application/json"}
 
@@ -62,7 +60,7 @@ class Dialog360LegacyType(ChannelType):
             response = requests.get(templates_url, headers=self.get_headers(channel))
             response.raise_for_status()
             HTTPLog.from_response(HTTPLog.WHATSAPP_TEMPLATES_SYNCED, response, start, timezone.now(), channel=channel)
-        except Exception as e:
+        except requests.RequestException as e:
             HTTPLog.from_exception(HTTPLog.WHATSAPP_TEMPLATES_SYNCED, e, start, channel=channel)
             raise e
 

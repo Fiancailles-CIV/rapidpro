@@ -136,10 +136,8 @@ class CampaignCRUDL(SmartCRUDL):
                         _("New Event"),
                         "event-add",
                         f"{reverse('campaigns.campaignevent_create')}?campaign={obj.id}",
+                        as_button=True,
                     )
-
-                if self.has_org_perm("orgs.org_export"):
-                    menu.add_link(_("Export"), f"{reverse('orgs.org_export')}?campaign={obj.id}")
 
                 if self.has_org_perm("campaigns.campaign_update"):
                     menu.add_modax(
@@ -148,6 +146,9 @@ class CampaignCRUDL(SmartCRUDL):
                         reverse("campaigns.campaign_update", args=[obj.id]),
                         title=_("Edit Campaign"),
                     )
+
+                if self.has_org_perm("orgs.org_export"):
+                    menu.add_link(_("Export"), f"{reverse('orgs.org_export')}?campaign={obj.id}")
 
                 if self.has_org_perm("campaigns.campaign_archive"):
                     menu.add_url_post(_("Archive"), reverse("campaigns.campaign_archive", args=[obj.id]))
@@ -560,8 +561,6 @@ class CampaignEventCRUDL(SmartCRUDL):
 
     class Update(OrgObjPermsMixin, ModalMixin, SmartUpdateView):
         form_class = CampaignEventForm
-        submit_button_name = _("Save")
-
         default_fields = [
             "event_type",
             "flow_to_start",
@@ -673,7 +672,6 @@ class CampaignEventCRUDL(SmartCRUDL):
         ]
         form_class = CampaignEventForm
         template_name = "campaigns/campaignevent_update.html"
-        submit_button_name = _("Save")
 
         def get_context_data(self, **kwargs):
             context = super().get_context_data(**kwargs)

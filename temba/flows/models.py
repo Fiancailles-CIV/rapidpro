@@ -18,7 +18,6 @@ from django.utils.translation import gettext_lazy as _
 from temba import mailroom
 from temba.channels.models import Channel
 from temba.classifiers.models import Classifier
-from temba.contacts import search
 from temba.contacts.models import Contact, ContactField, ContactGroup
 from temba.globals.models import Global
 from temba.msgs.models import Label, OptIn
@@ -349,13 +348,11 @@ class Flow(LegacyUUIDMixin, TembaModel, DependencyMixin):
 
     @classmethod
     def export_translation(cls, org, flows, language):
-        flow_ids = [f.id for f in flows]
-        return mailroom.get_client().po_export(org.id, flow_ids, language=language)
+        return mailroom.get_client().po_export(org, flows, language=language)
 
     @classmethod
     def import_translation(cls, org, flows, language, po_data):
-        flow_ids = [f.id for f in flows]
-        response = mailroom.get_client().po_import(org.id, flow_ids, language=language, po_data=po_data)
+        response = mailroom.get_client().po_import(org, flows, language=language, po_data=po_data)
         return {d["uuid"]: d for d in response["flows"]}
 
     @classmethod
@@ -477,7 +474,7 @@ class Flow(LegacyUUIDMixin, TembaModel, DependencyMixin):
 
         definition = Flow.migrate_definition(definition, flow=None)
 
-        flow_info = mailroom.get_client().flow_inspect(self.org.id, definition)
+        flow_info = mailroom.get_client().flow_inspect(self.org, definition)
         dependencies = flow_info[Flow.INSPECT_DEPENDENCIES]
 
         # converts a dep ref {uuid|key, name, type, missing} to an importable partial definition {uuid|key, name}
@@ -764,7 +761,7 @@ class Flow(LegacyUUIDMixin, TembaModel, DependencyMixin):
         definition[Flow.DEFINITION_EXPIRE_AFTER_MINUTES] = self.expires_after_minutes
 
         # inspect the flow (with optional validation)
-        flow_info = mailroom.get_client().flow_inspect(self.org.id, definition)
+        flow_info = mailroom.get_client().flow_inspect(self.org, definition)
         dependencies = flow_info[Flow.INSPECT_DEPENDENCIES]
         issues = flow_info[Flow.INSPECT_ISSUES]
 
@@ -1022,8 +1019,8 @@ class FlowSession(models.Model):
 
         super().delete()
 
-    def __str__(self):  # pragma: no cover
-        return str(self.contact)
+    def __repr__(self):  # pragma: no cover
+        return f"<FlowSession: id={self.id} contact={self.contact.id}>"
 
     class Meta:
         indexes = [
@@ -1175,8 +1172,8 @@ class FlowRun(models.Model):
 
             super().delete()
 
-    def __str__(self):  # pragma: no cover
-        return f"FlowRun[uuid={self.uuid}, flow={self.flow.uuid}]"
+    def __repr__(self):  # pragma: no cover
+        return f"<FlowRun: id={self.id} flow={self.flow.name}>"
 
     class Meta:
         indexes = [
@@ -1887,7 +1884,7 @@ class FlowStart(models.Model):
         Requests a preview of the recipients of a start created with the given inclusions/exclusions, returning a tuple
         of the canonical query and the total count of contacts.
         """
-        preview = search.preview_start(flow.org, flow, include=include, exclude=exclude)
+        preview = mailroom.get_client().flow_start_preview(flow.org, flow, include=include, exclude=exclude)
 
         return preview.query, preview.total
 

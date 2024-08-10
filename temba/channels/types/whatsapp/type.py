@@ -34,10 +34,7 @@ class WhatsAppType(ChannelType):
     claim_blurb = _("If you have an enterprise WhatsApp account, you can connect it to communicate with your contacts")
     claim_view = ClaimView
 
-    menu_items = [
-        dict(label=_("Message Templates"), view_name="templates.templatetranslation_channel"),
-        dict(label=_("Verify Number"), view_name="channels.types.whatsapp.request_code"),
-    ]
+    menu_items = [dict(label=_("Verify Number"), view_name="channels.types.whatsapp.request_code")]
 
     def get_urls(self):
         return [
@@ -91,7 +88,7 @@ class WhatsAppType(ChannelType):
 
                 templates.extend(response.json()["data"])
                 url = response.json().get("paging", {}).get("next", None)
-            except Exception as e:
+            except requests.RequestException as e:
                 HTTPLog.from_exception(HTTPLog.WHATSAPP_TEMPLATES_SYNCED, e, start, channel=channel)
                 raise e
 

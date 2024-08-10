@@ -710,7 +710,16 @@ class UserCRUDL(SmartCRUDL):
             )
 
             def clean_email(self):
-                return self.cleaned_data["email"].lower().strip()
+                email = self.cleaned_data["email"].lower().strip()
+
+                self.user = User.objects.filter(email__iexact=email).first()
+
+                # error if we've sent a recovery email to this user recently to prevent flooding
+                five_mins_ago = timezone.now() - timedelta(minutes=5)
+                if self.user and self.user.recovery_tokens.filter(created_on__gt=five_mins_ago).exists():
+                    raise forms.ValidationError(_("A recovery email was already sent to this address recently."))
+
+                return email
 
         form_class = Form
         permission = None
@@ -721,7 +730,7 @@ class UserCRUDL(SmartCRUDL):
 
         def form_valid(self, form):
             email = form.cleaned_data["email"]
-            user = User.objects.filter(email__iexact=email).first()
+            user = form.user
 
             if user:
                 # delete any previously generated recovery tokens and create a new one
@@ -851,7 +860,8 @@ class UserCRUDL(SmartCRUDL):
                 user = self.instance
                 email = self.cleaned_data["email"].lower()
 
-                if User.objects.filter(username=email).exclude(pk=user.pk):
+                existing = User.get_by_email(email)
+                if existing and existing != user:
                     raise forms.ValidationError(_("Sorry, that email address is already taken."))
 
                 return email
@@ -1166,7 +1176,6 @@ class MenuMixin(OrgPermsMixin):
     def create_list(self, name, href, type):
         return {"id": name, "href": href, "type": type}
 
-    # TODO: Decide whether we want to keep this at all
     def create_modax_button(self, name, href, icon=None, on_submit=None):  # pragma: no cover
         menu_item = {"id": slugify(name), "name": name, "type": "modax-button"}
         if href:
@@ -1349,6 +1358,7 @@ class OrgCRUDL(SmartCRUDL):
                             name=_("Dashboard"),
                             icon="dashboard",
                             href="dashboard.dashboard_home",
+                            perm="orgs.org_dashboard",
                         )
                     )
 
@@ -1379,10 +1389,23 @@ class OrgCRUDL(SmartCRUDL):
                         self.create_menu_item(name=_("Incidents"), icon="incidents", href="notifications.incident_list")
                     )
 
+                menu.append(self.create_divider())
+                if self.has_org_perm("orgs.org_export"):
+                    menu.append(self.create_menu_item(name=_("Export"), icon="export", href="orgs.org_export"))
+
+                if self.has_org_perm("orgs.orgimport_create"):
+                    menu.append(self.create_menu_item(name=_("Import"), icon="import", href="orgs.orgimport_create"))
+
                 if self.has_org_perm("channels.channel_read"):
                     from temba.channels.views import get_channel_read_url
 
                     items = []
+
+                    if self.has_org_perm("channels.channel_claim"):
+                        items.append(
+                            self.create_menu_item(name=_("New Channel"), href="channels.channel_claim", icon="add")
+                        )
+
                     channels = org.channels.filter(is_active=True).order_by(Lower("name"))
                     for channel in channels:
                         items.append(
@@ -1399,6 +1422,14 @@ class OrgCRUDL(SmartCRUDL):
 
                 if self.has_org_perm("classifiers.classifier_read"):
                     items = []
+
+                    if self.has_org_perm("classifiers.classifier_connect"):
+                        items.append(
+                            self.create_menu_item(
+                                name=_("New Classifier"), href="classifiers.classifier_connect", icon="add"
+                            )
+                        )
+
                     classifiers = org.classifiers.filter(is_active=True).order_by(Lower("name"))
                     for classifier in classifiers:
                         items.append(
@@ -1604,7 +1635,7 @@ class OrgCRUDL(SmartCRUDL):
 
     class Export(SpaMixin, InferOrgMixin, OrgPermsMixin, SmartTemplateView):
         title = _("Create Export")
-        menu_path = "/settings/workspace"
+        menu_path = "/settings/export"
         submit_button_name = _("Export")
         success_message = _("We are preparing your export and you will get a notification when it is complete.")
 
@@ -1974,20 +2005,23 @@ class OrgCRUDL(SmartCRUDL):
             def __init__(self, org, *args, **kwargs):
                 super().__init__(*args, **kwargs)
 
-                role_choices = [(r.code, r.display) for r in org.get_allowed_user_roles()]
-
                 self.org = org
                 self.user_rows = []
                 self.invite_rows = []
-                self.add_per_user_fields(org, role_choices)
+                self.add_per_user_fields(org)
                 self.add_per_invite_fields(org)
 
-            def add_per_user_fields(self, org: Org, role_choices: list):
+            def add_per_user_fields(self, org: Org):
+                role_choices = [(r.code, r.display) for r in (OrgRole.ADMINISTRATOR, OrgRole.EDITOR, OrgRole.AGENT)]
+                role_choices_inc_viewer = role_choices + [(OrgRole.VIEWER.code, OrgRole.VIEWER.display)]
+
                 for user in org.users.order_by("email"):
+                    role = org.get_user_role(user)
+
                     role_field = forms.ChoiceField(
-                        choices=role_choices,
+                        choices=role_choices_inc_viewer if role == OrgRole.VIEWER else role_choices,
                         required=True,
-                        initial=org.get_user_role(user).code,
+                        initial=role.code,
                         label=" ",
                         widget=SelectWidget(),
                     )
@@ -2005,7 +2039,7 @@ class OrgCRUDL(SmartCRUDL):
             def add_per_invite_fields(self, org: Org):
                 for invite in org.invitations.filter(is_active=True).order_by("email"):
                     role_field = forms.ChoiceField(
-                        choices=[(r.code, r.display) for r in OrgRole],
+                        choices=[(r.code, r.display) for r in (OrgRole.ADMINISTRATOR, OrgRole.EDITOR, OrgRole.AGENT)],
                         required=True,
                         initial=invite.role.code,
                         label=" ",
@@ -2070,7 +2104,6 @@ class OrgCRUDL(SmartCRUDL):
 
         form_class = AccountsForm
         success_url = "@orgs.org_manage_accounts"
-        submit_button_name = _("Save Changes")
         title = _("Users")
         menu_path = "/settings/users"
 
@@ -2088,9 +2121,7 @@ class OrgCRUDL(SmartCRUDL):
 
         def post_save(self, obj):
             obj = super().post_save(obj)
-
             org = self.get_object()
-            allowed_roles = org.get_allowed_user_roles()
 
             # delete any invitations which have been checked for removal
             for invite in self.form.get_submitted_invite_removals():
@@ -2100,7 +2131,7 @@ class OrgCRUDL(SmartCRUDL):
             for user, new_role in self.form.get_submitted_roles().items():
                 if not new_role:
                     org.remove_user(user)
-                elif org.get_user_role(user) != new_role and new_role in allowed_roles:
+                elif org.get_user_role(user) != new_role:
                     org.add_user(user, new_role)
 
                 # when a user's role changes, delete any API tokens they're no longer allowed to have
@@ -2115,6 +2146,7 @@ class OrgCRUDL(SmartCRUDL):
             org = self.get_object()
             context["org"] = org
             context["has_invites"] = org.invitations.filter(is_active=True).exists()
+            context["has_viewers"] = org.get_users(roles=[OrgRole.VIEWER]).exists()
             return context
 
         def get_success_url(self):
@@ -2369,13 +2401,13 @@ class OrgCRUDL(SmartCRUDL):
             secret = self.kwargs["secret"]
 
             # if user exists and is logged in then they just need to accept
-            user_exists = User.objects.filter(username=self.invitation.email).exists()
-            if user_exists and self.invitation.email == request.user.username:
+            user = User.get_by_email(self.invitation.email)
+            if user and self.invitation.email == request.user.username:
                 return HttpResponseRedirect(reverse("orgs.org_join_accept", args=[secret]))
 
             logout(request)
 
-            if not user_exists:
+            if not user:
                 return HttpResponseRedirect(reverse("orgs.org_join_signup", args=[secret]))
 
     class JoinSignup(NoNavMixin, InvitationMixin, SmartUpdateView):
@@ -2395,7 +2427,7 @@ class OrgCRUDL(SmartCRUDL):
                 return resp
 
             # if user already exists, we shouldn't be here
-            if User.objects.filter(username=self.invitation.email).exists():
+            if User.get_by_email(self.invitation.email):
                 return HttpResponseRedirect(reverse("orgs.org_join", args=[self.kwargs["secret"]]))
 
             return None
@@ -2441,8 +2473,8 @@ class OrgCRUDL(SmartCRUDL):
                 return resp
 
             # if user doesn't already exist or we're logged in as a different user, we shouldn't be here
-            user_exists = User.objects.filter(username=self.invitation.email).exists()
-            if not user_exists or self.invitation.email != request.user.username:
+            user = User.get_by_email(self.invitation.email)
+            if not user or self.invitation.email != request.user.username:
                 return HttpResponseRedirect(reverse("orgs.org_join", args=[self.kwargs["secret"]]))
 
             return None
@@ -2454,7 +2486,7 @@ class OrgCRUDL(SmartCRUDL):
 
             switch_to_org(self.request, obj)
 
-    class Grant(NonAtomicMixin, SmartCreateView):
+    class Grant(SpaMixin, ComponentFormMixin, NonAtomicMixin, SmartCreateView):
         class Form(forms.ModelForm):
             first_name = forms.CharField(
                 help_text=_("The first name of the workspace administrator"),
@@ -2484,8 +2516,7 @@ class OrgCRUDL(SmartCRUDL):
                 # for granting new accounts, either the email maps to an existing user (and their existing password is used)
                 # or both email and password must be included
                 if email:
-                    user = User.objects.filter(username__iexact=email).first()
-                    if user:
+                    if User.get_by_email(email):
                         if password:
                             raise ValidationError(_("Login already exists, please do not include password."))
                     else:
@@ -2505,6 +2536,7 @@ class OrgCRUDL(SmartCRUDL):
         success_message = "Workspace successfully created."
         submit_button_name = _("Create")
         success_url = "@orgs.org_grant"
+        menu_path = "/settings"
 
         def save(self, obj):
             self.object = Org.create(
@@ -2525,7 +2557,6 @@ class OrgCRUDL(SmartCRUDL):
         title = _("Sign Up")
         form_class = SignupForm
         permission = None
-        submit_button_name = _("Save")
 
         def get_success_url(self):
             return "%s?start" % reverse("public.public_welcome")
@@ -2626,53 +2657,34 @@ class OrgCRUDL(SmartCRUDL):
             return super().pre_save(obj)
 
     class Prometheus(InferOrgMixin, OrgPermsMixin, SmartUpdateView):
-        class ToggleForm(forms.ModelForm):
+        class Form(forms.ModelForm):
             class Meta:
                 model = Org
                 fields = ("id",)
 
-        form_class = ToggleForm
+        form_class = Form
         success_url = "@orgs.org_workspace"
 
-        def post_save(self, obj):
-            # if org has an existing Prometheus token, disable it, otherwise create one
+        def save(self, obj):
             org = self.request.org
-            existing = self.get_token(org)
-            if existing:
-                existing.release()
+
+            # if org has an existing Prometheus token, disable it, otherwise create one
+            if org.prometheus_token:
+                org.prometheus_token = None
+                org.save(update_fields=("prometheus_token",))
             else:
-                APIToken.get_or_create(self.request.org, self.request.user, prometheus=True)
+                org.prometheus_token = generate_secret(40)
+                org.save(update_fields=("prometheus_token",))
 
         def get_context_data(self, **kwargs):
             context = super().get_context_data(**kwargs)
             org = self.request.org
-            token = self.get_token(org)
-            if token:
-                context["prometheus_token"] = token.key
-                context["prometheus_url"] = f"https://{org.branding['domain']}/mr/org/{org.uuid}/metrics"
-
+            context["prometheus_url"] = f"https://{org.branding['domain']}/mr/org/{org.uuid}/metrics"
             return context
-
-        def get_token(self, org):
-            return APIToken.objects.filter(is_active=True, org=org, role=Group.objects.get(name="Prometheus")).first()
 
     class Workspace(SpaMixin, FormaxMixin, ContentMenuMixin, InferOrgMixin, OrgPermsMixin, SmartReadView):
         title = _("Workspace")
         menu_path = "/settings/workspace"
-
-        def build_content_menu(self, menu):
-            menu.add_link(_("New Channel"), reverse("channels.channel_claim"), as_button=True)
-
-            if self.has_org_perm("classifiers.classifier_connect"):
-                menu.add_link(_("New Classifier"), reverse("classifiers.classifier_connect"))
-
-            menu.new_group()
-
-            if self.has_org_perm("orgs.org_export"):
-                menu.add_link(_("Export"), reverse("orgs.org_export"))
-
-            if self.has_org_perm("orgs.orgimport_create"):
-                menu.add_link(_("Import"), reverse("orgs.orgimport_create"))
 
         def derive_formax_sections(self, formax, context):
             if self.has_org_perm("orgs.org_edit"):
@@ -2933,7 +2945,7 @@ class OrgImportCRUDL(SmartCRUDL):
     actions = ("create", "read")
 
     class Create(SpaMixin, OrgPermsMixin, SmartCreateView):
-        menu_path = "/settings/workspace"
+        menu_path = "/settings/import"
 
         class Form(forms.ModelForm):
             file = forms.FileField(help_text=_("The import file"))
@@ -2981,7 +2993,7 @@ class OrgImportCRUDL(SmartCRUDL):
             return obj
 
     class Read(SpaMixin, OrgPermsMixin, SmartReadView):
-        menu_path = "/settings/workspace"
+        menu_path = "/settings/import"
 
         def derive_title(self):
             return _("Import Flows and Campaigns")

@@ -9,8 +9,8 @@
     ]
   },
   "dependencies": {
-    "@nyaruka/flow-editor": "1.33.0",
-    "@nyaruka/temba-components": "0.91.6",
+    "@nyaruka/flow-editor": "1.35.1",
+    "@nyaruka/temba-components": "0.104.0",
     "codemirror": "5.18.2",
     "colorette": "1.2.2",
     "fa-icons": "0.2.0",
@@ -32,7 +32,8 @@
     "autoprefixer": "10.2.5",
     "bower": "1.8.8",
     "jasmine-core": "2.5.0",
-    "postcss": "8.3.0",
+    "postcss": "8.4.38",
+    "postcss-cli": "11.0.0",
     "postcss-import": "14.0.2",
     "postcss-loader": "5.3.0",
     "postcss-scss": "3.0.5",

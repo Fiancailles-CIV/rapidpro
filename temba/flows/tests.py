@@ -22,7 +22,7 @@ from temba.contacts.models import URN, Contact, ContactField, ContactGroup, Cont
 from temba.globals.models import Global
 from temba.orgs.integrations.dtone import DTOneType
 from temba.orgs.models import Export
-from temba.templates.models import Template, TemplateTranslation
+from temba.templates.models import TemplateTranslation
 from temba.tests import CRUDLTestMixin, MockJsonResponse, TembaTest, matchers, mock_mailroom, override_brand
 from temba.tests.base import get_contact_search
 from temba.tests.engine import MockSessionWriter
@@ -1514,23 +1514,6 @@ class FlowCRUDLTest(TembaTest, CRUDLTestMixin):
             response.context["form"].fields["flow_type"].choices,
         )
 
-        # if surveyor feature is enabled, that becomes a flow type option
-        with self.settings(FEATURES={"surveyor"}):
-            response = self.assertCreateFetch(
-                create_url,
-                [self.admin],
-                form_fields=["name", "keyword_triggers", "flow_type", "base_language"],
-            )
-            self.assertEqual(
-                [
-                    (Flow.TYPE_MESSAGE, "Messaging"),
-                    (Flow.TYPE_VOICE, "Phone Call"),
-                    (Flow.TYPE_BACKGROUND, "Background"),
-                    (Flow.TYPE_SURVEY, "Surveyor"),
-                ],
-                response.context["form"].fields["flow_type"].choices,
-            )
-
         # try to submit without name or language
         self.assertCreateSubmit(
             create_url,
@@ -1645,7 +1628,6 @@ class FlowCRUDLTest(TembaTest, CRUDLTestMixin):
         flow2 = Flow.objects.get(name="Flow 2")
         self.assertEqual([["test"]], list(flow2.triggers.order_by("id").values_list("keywords", flat=True)))
 
-    @override_settings(FEATURES={"surveyor"})
     def test_views(self):
         create_url = reverse("flows.flow_create")
 
@@ -1710,30 +1692,6 @@ class FlowCRUDLTest(TembaTest, CRUDLTestMixin):
             flow1,
             keywords=["unique"],
             match_type=Trigger.MATCH_FIRST_WORD,
-        )
-
-        # create a new surveyor flow
-        self.client.post(create_url, {"name": "Surveyor Flow", "flow_type": Flow.TYPE_SURVEY, "base_language": "eng"})
-        flow2 = Flow.objects.get(org=self.org, name="Surveyor Flow")
-        self.assertEqual(flow2.flow_type, "S")
-        self.assertEqual(flow2.expires_after_minutes, 0)
-
-        # make sure we don't get a start flow button for Android Surveys
-        response = self.client.get(reverse("flows.flow_editor", args=[flow2.uuid]))
-        self.assertContentMenu(
-            reverse("flows.flow_editor", args=[flow2.uuid]),
-            self.admin,
-            [
-                "Results",
-                "-",
-                "Edit",
-                "Copy",
-                "Delete",
-                "-",
-                "Export Definition",
-                "Export Translation",
-                "Import Translation",
-            ],
         )
 
         # create a new voice flow
@@ -1809,7 +1767,7 @@ class FlowCRUDLTest(TembaTest, CRUDLTestMixin):
 
         # check flow listing
         response = self.client.get(reverse("flows.flow_list"))
-        self.assertEqual(list(response.context["object_list"]), [flow3, voice_flow, flow2, flow1, flow])  # by saved_on
+        self.assertEqual(list(response.context["object_list"]), [flow3, voice_flow, flow1, flow])  # by saved_on
 
         # test update view
         response = self.client.post(reverse("flows.flow_update", args=[flow.id]))
@@ -2081,7 +2039,7 @@ class FlowCRUDLTest(TembaTest, CRUDLTestMixin):
         self.assertEqual(1, response.context["folders"][0]["count"])
         self.assertEqual(2, response.context["folders"][1]["count"])
 
-        self.assertEqual(("archive", "label", "download-results"), response.context["actions"])
+        self.assertEqual(("archive", "label", "export-results"), response.context["actions"])
 
         # but does appear in archived list
         response = self.client.get(reverse("flows.flow_archived"))
@@ -2168,13 +2126,13 @@ class FlowCRUDLTest(TembaTest, CRUDLTestMixin):
         response = self.client.get(reverse("flows.flow_filter", args=[label1.uuid]))
         self.assertEqual([flow2, flow1], list(response.context["object_list"]))
         self.assertEqual(2, len(response.context["labels"]))
-        self.assertEqual(("label", "download-results"), response.context["actions"])
+        self.assertEqual(("label", "export-results"), response.context["actions"])
 
         response = self.client.get(reverse("flows.flow_filter", args=[label2.uuid]))
         self.assertEqual([flow2], list(response.context["object_list"]))
 
         response = self.client.get(reverse("flows.flow_filter", args=[label2.uuid]))
-        self.assertEquals(f"/flow/labels/{label2.uuid}", response.headers.get(TEMBA_MENU_SELECTION))
+        self.assertEqual(f"/flow/labels/{label2.uuid}", response.headers.get(TEMBA_MENU_SELECTION))
 
     def test_get_definition(self):
         flow = self.get_flow("color_v13")
@@ -2484,7 +2442,10 @@ class FlowCRUDLTest(TembaTest, CRUDLTestMixin):
 
             self.assertEqual(
                 response.json()["warnings"][0],
-                "You've selected a lot of contacts! Depending on your channel it could take days to reach everybody and could reduce response rates. Click on <b>Skip inactive contacts</b> below to limit your selection to contacts who are more likely to respond.",
+                "You've selected a lot of contacts! Depending on your channel "
+                "it could take days to reach everybody and could reduce response rates. "
+                "Filter for contacts that have sent a message recently "
+                "to limit your selection to contacts who are more likely to respond.",
             )
 
             # if we release our send channel we also can't start a regular messaging flow
@@ -2580,13 +2541,13 @@ class FlowCRUDLTest(TembaTest, CRUDLTestMixin):
             content_type="application/json",
         )
 
-        self.assertEquals(
+        self.assertEqual(
             response.json()["warnings"],
             ["The message template affirmation does not exist on your account and cannot be sent."],
         )
 
         # create the template, but no translations
-        Template.objects.create(org=self.org, name="affirmation", uuid="f712e05c-bbed-40f1-b3d9-671bb9b60775")
+        template = self.create_template("affirmation", [], uuid="f712e05c-bbed-40f1-b3d9-671bb9b60775")
 
         # will be warned again
         mr_mocks.flow_start_preview(query="age > 30", total=2)
@@ -2598,14 +2559,14 @@ class FlowCRUDLTest(TembaTest, CRUDLTestMixin):
             content_type="application/json",
         )
 
-        self.assertEquals(
+        self.assertEqual(
             response.json()["warnings"], ["Your message template affirmation is not approved and cannot be sent."]
         )
 
         # create a translation, but not approved
-        TemplateTranslation.get_or_create(
-            self.channel,
-            "affirmation",
+        TemplateTranslation.objects.create(
+            template=template,
+            channel=self.channel,
             locale="eng-US",
             status=TemplateTranslation.STATUS_REJECTED,
             external_id="id1",
@@ -2625,7 +2586,7 @@ class FlowCRUDLTest(TembaTest, CRUDLTestMixin):
             content_type="application/json",
         )
 
-        self.assertEquals(
+        self.assertEqual(
             response.json()["warnings"], ["Your message template affirmation is not approved and cannot be sent."]
         )
 
@@ -2642,7 +2603,7 @@ class FlowCRUDLTest(TembaTest, CRUDLTestMixin):
             content_type="application/json",
         )
 
-        self.assertEquals(response.json()["warnings"], [])
+        self.assertEqual(response.json()["warnings"], [])
 
     @mock_mailroom
     def test_start(self, mr_mocks):
@@ -2654,7 +2615,7 @@ class FlowCRUDLTest(TembaTest, CRUDLTestMixin):
         self.assertUpdateFetch(start_url, [self.editor, self.admin], form_fields=["flow", "contact_search"])
 
         # create flow start with a query
-        mr_mocks.parse_query("frank", cleaned='name ~ "frank"')
+        mr_mocks.contact_parse_query("frank", cleaned='name ~ "frank"')
         self.assertUpdateSubmit(
             start_url,
             self.admin,
@@ -2701,7 +2662,7 @@ class FlowCRUDLTest(TembaTest, CRUDLTestMixin):
         )
 
         query = f"uuid='{contact.uuid}'"
-        mr_mocks.parse_query(query, cleaned=query)
+        mr_mocks.contact_parse_query(query, cleaned=query)
 
         # create flow start with exclude_in_other and exclude_reruns both left unchecked
         self.assertUpdateSubmit(
@@ -2728,7 +2689,7 @@ class FlowCRUDLTest(TembaTest, CRUDLTestMixin):
         flow = self.create_flow("Background", flow_type=Flow.TYPE_BACKGROUND)
 
         # create flow start with a query
-        mr_mocks.parse_query("frank", cleaned='name ~ "frank"')
+        mr_mocks.contact_parse_query("frank", cleaned='name ~ "frank"')
 
         start_url = f"{reverse('flows.flow_start', args=[])}?flow={flow.id}"
         self.assertUpdateSubmit(
@@ -3161,40 +3122,38 @@ class FlowCRUDLTest(TembaTest, CRUDLTestMixin):
         flow = self.get_flow("favorites")
         export_url = reverse("flows.flow_export_translation", args=[flow.id])
 
-        self.assertRequestDisallowed(export_url, [None, self.user, self.agent, self.admin2])
-        self.assertUpdateFetch(export_url, [self.editor, self.admin], form_fields=["language"])
+        self.assertRequestDisallowed(export_url, [None, self.agent, self.admin2])
+        self.assertUpdateFetch(export_url, [self.user, self.editor, self.admin], form_fields=["language"])
 
         # submit with no language
-        response = self.assertUpdateSubmit(export_url, self.admin, {})
+        response = self.assertUpdateSubmit(export_url, self.admin, {}, success_status=200)
 
-        self.assertEqual(f"/flow/download_translation/?flow={flow.id}&language=", response.url)
+        download_url = response["Temba-Success"]
+        self.assertEqual(f"/flow/download_translation/?flow={flow.id}&language=", download_url)
 
         # check fetching the PO from the download link
-        with patch("temba.mailroom.client.MailroomClient.po_export") as mock_po_export:
+        with patch("temba.mailroom.client.client.MailroomClient.po_export") as mock_po_export:
             mock_po_export.return_value = b'msgid "Red"\nmsgstr "Roja"\n\n'
-            self.assertRequestDisallowed(response.url, [None, self.user, self.agent, self.admin2])
-            response = self.assertReadFetch(response.url, [self.editor, self.admin])
+            self.assertRequestDisallowed(download_url, [None, self.agent, self.admin2])
+            response = self.assertReadFetch(download_url, [self.user, self.editor, self.admin])
 
             self.assertEqual(b'msgid "Red"\nmsgstr "Roja"\n\n', response.content)
             self.assertEqual('attachment; filename="favorites.po"', response["Content-Disposition"])
             self.assertEqual("text/x-gettext-translation", response["Content-Type"])
 
         # submit with a language
-        response = self.assertUpdateSubmit(export_url, self.admin, {"language": "spa"})
+        response = self.assertUpdateSubmit(export_url, self.admin, {"language": "spa"}, success_status=200)
 
-        self.assertEqual(f"/flow/download_translation/?flow={flow.id}&language=spa", response.url)
+        download_url = response["Temba-Success"]
+        self.assertEqual(f"/flow/download_translation/?flow={flow.id}&language=spa", download_url)
 
         # check fetching the PO from the download link
-        with patch("temba.mailroom.client.MailroomClient.po_export") as mock_po_export:
+        with patch("temba.mailroom.client.client.MailroomClient.po_export") as mock_po_export:
             mock_po_export.return_value = b'msgid "Red"\nmsgstr "Roja"\n\n'
-            response = self.requestView(response.url, self.admin)
+            response = self.requestView(download_url, self.admin)
 
             # filename includes language now
             self.assertEqual('attachment; filename="favorites.spa.po"', response["Content-Disposition"])
-
-        # check submitting the form from a modal
-        response = self.client.post(export_url, data={}, HTTP_X_PJAX=True)
-        self.assertEqual(f"/flow/download_translation/?flow={flow.id}&language=", response["Temba-Success"])
 
     def test_import_translation(self):
         self.org.set_flow_languages(self.admin, ["eng", "spa"])
@@ -3306,7 +3265,7 @@ msgstr "Azul"
         self.assertEqual({"language": "spa"}, response.context["form"].initial)
 
         # confirm the import
-        with patch("temba.mailroom.client.MailroomClient.po_import") as mock_po_import:
+        with patch("temba.mailroom.client.client.MailroomClient.po_import") as mock_po_import:
             mock_po_import.return_value = {"flows": [flow.get_definition()]}
 
             response = self.requestView(step2_url, self.admin, post_data={"language": "spa"})
@@ -5316,14 +5275,18 @@ class FlowStartCRUDLTest(TembaTest, CRUDLTestMixin):
     def test_list(self):
         list_url = reverse("flows.flowstart_list")
 
-        flow = self.get_flow("color_v13")
+        flow1 = self.create_flow("Test Flow 1")
+        flow2 = self.create_flow("Test 2")
+
         contact = self.create_contact("Bob", phone="+1234567890")
         group = self.create_group("Testers", contacts=[contact])
-        start1 = FlowStart.create(flow, self.admin, contacts=[contact])
+        start1 = FlowStart.create(flow1, self.admin, contacts=[contact])
         start2 = FlowStart.create(
-            flow, self.admin, query="name ~ Bob", start_type="A", exclusions={"started_previously": True}
+            flow1, self.admin, query="name ~ Bob", start_type="A", exclusions={"started_previously": True}
         )
-        start3 = FlowStart.create(flow, self.admin, groups=[group], start_type="Z", exclusions={"in_a_flow": True})
+        start3 = FlowStart.create(flow2, self.admin, groups=[group], start_type="Z", exclusions={"in_a_flow": True})
+
+        flow2.release(self.admin)
 
         FlowStartCount.objects.create(start=start3, count=1000)
         FlowStartCount.objects.create(start=start3, count=234)
@@ -5336,10 +5299,13 @@ class FlowStartCRUDLTest(TembaTest, CRUDLTestMixin):
             list_url, [self.user, self.editor, self.admin], context_objects=[start3, start2, start1]
         )
 
+        self.assertContains(response, "Test Flow 1")
+        self.assertNotContains(response, "Test Flow 2")
+        self.assertContains(response, "A deleted flow")
         self.assertContains(response, "was started by admin@nyaruka.com")
         self.assertContains(response, "was started by an API call")
         self.assertContains(response, "was started by Zapier")
-        self.assertContains(response, "Skip contacts currently in a flow")
+        self.assertContains(response, "Not in a flow")
         self.assertContains(response, "<b>1,234</b> runs")
 
         response = self.assertListFetch(list_url + "?type=manual", [self.admin], context_objects=[start1])

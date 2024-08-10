@@ -64,8 +64,6 @@ class TwilioWhatsappType(ChannelType):
         ],
     )
 
-    menu_items = [dict(label=_("Message Templates"), view_name="templates.templatetranslation_channel")]
-
     def get_error_ref_url(self, channel, code: str) -> str:
         return f"https://www.twilio.com/docs/api/errors/{code}"
 
@@ -93,7 +91,7 @@ class TwilioWhatsappType(ChannelType):
 
                 twilio_templates.extend(response.json()["contents"])
                 url = response.json().get("meta", {}).get("next_page_url", None)
-            except Exception as e:
+            except requests.RequestException as e:
                 HTTPLog.from_exception(HTTPLog.WHATSAPP_TEMPLATES_SYNCED, e, start, channel=channel)
                 raise e
 

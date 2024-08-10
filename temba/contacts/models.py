@@ -26,15 +26,13 @@ from temba import mailroom
 from temba.channels.models import Channel
 from temba.locations.models import AdminBoundary
 from temba.mailroom import ContactSpec, modifiers, queue_populate_dynamic_group
-from temba.orgs.models import DependencyMixin, Export, ExportType, Org, OrgRole
+from temba.orgs.models import DependencyMixin, Export, ExportType, Org, OrgRole, User
 from temba.utils import chunk_list, format_number, on_transaction_commit
 from temba.utils.export import MultiSheetExporter
 from temba.utils.models import JSONField, LegacyUUIDMixin, SquashableModel, TembaModel, delete_in_batches
 from temba.utils.text import decode_stream, unsnakify
 from temba.utils.urns import ParsedURN, parse_number, parse_urn
 from temba.utils.uuid import uuid4
-
-from .search import parse_query
 
 logger = logging.getLogger(__name__)
 
@@ -568,6 +566,12 @@ class Contact(LegacyUUIDMixin, SmartModel):
         (STATUS_STOPPED, "Stopped"),
         (STATUS_ARCHIVED, "Archived"),
     )
+    ENGINE_STATUSES = {
+        STATUS_ACTIVE: "active",
+        STATUS_BLOCKED: "blocked",
+        STATUS_STOPPED: "stopped",
+        STATUS_ARCHIVED: "archived",
+    }
 
     org = models.ForeignKey(Org, on_delete=models.PROTECT, related_name="contacts")
 
@@ -600,17 +604,28 @@ class Contact(LegacyUUIDMixin, SmartModel):
 
     @classmethod
     def create(
-        cls, org, user, name: str, language: str, urns: list[str], fields: dict[ContactField, str], groups: list
+        cls,
+        org,
+        user,
+        *,
+        name: str,
+        language: str,
+        status: str,
+        urns: list[str],
+        fields: dict[ContactField, str],
+        groups: list,
     ):
+        engine_status = cls.ENGINE_STATUSES[status]
         fields_by_key = {f.key: v for f, v in fields.items()}
         group_uuids = [g.uuid for g in groups]
 
-        response = mailroom.get_client().contact_create(
-            org.id,
-            user.id,
-            ContactSpec(name=name, language=language, urns=urns, fields=fields_by_key, groups=group_uuids),
+        return mailroom.get_client().contact_create(
+            org,
+            user,
+            ContactSpec(
+                name=name, language=language, status=engine_status, urns=urns, fields=fields_by_key, groups=group_uuids
+            ),
         )
-        return Contact.objects.get(id=response["contact"]["id"])
 
     @property
     def anon_display(self):
@@ -928,7 +943,7 @@ class Contact(LegacyUUIDMixin, SmartModel):
         org = contacts[0].org
         client = mailroom.get_client()
         try:
-            response = client.contact_modify(org.id, user.id, [c.id for c in contacts], mods)
+            response = client.contact_modify(org, user, contacts, mods)
         except mailroom.RequestException as e:
             logger.error(f"Contact update failed: {str(e)}", exc_info=True)
             raise e
@@ -980,14 +995,24 @@ class Contact(LegacyUUIDMixin, SmartModel):
 
             on_transaction_commit(lambda: release_contacts.delay(user.id, [c.id for c in contacts]))
 
-    def open_ticket(self, user, topic, body: str, assignee=None):
+    def set_note(self, user, text):
+        """
+        Adds a note to this contact, prunes old ones if necessary
+        """
+        self.notes.create(text=text, created_by=user)
+
+        # remove all notes except the last 5
+        notes = self.notes.order_by("-id").values_list("id", flat=True)[5:]
+        self.notes.filter(id__in=notes).delete()
+
+    def open_ticket(self, user, *, topic, assignee, note: str):
         """
         Opens a new ticket for this contact.
         """
         mod = modifiers.Ticket(
             topic=modifiers.TopicRef(uuid=str(topic.uuid), name=topic.name),
-            body=body or "",
             assignee=modifiers.UserRef(email=assignee.email, name=assignee.name) if assignee else None,
+            note=note,
         )
         self.modify(user, [mod], refresh=False)
         return self.tickets.order_by("id").last()
@@ -997,8 +1022,8 @@ class Contact(LegacyUUIDMixin, SmartModel):
         Interrupts this contact's current flow
         """
         if self.current_flow:
-            sessions = mailroom.get_client().contact_interrupt(self.org.id, user.id, self.id)
-            return len(sessions) > 0
+            return mailroom.get_client().contact_interrupt(self.org, user, self) > 0
+
         return False
 
     def block(self, user):
@@ -1160,9 +1185,7 @@ class Contact(LegacyUUIDMixin, SmartModel):
         if not contacts:
             return {}
 
-        resp = mailroom.get_client().contact_inspect(contacts[0].org_id, [c.id for c in contacts])
-
-        return {c: resp[str(c.id)] for c in contacts}
+        return mailroom.get_client().contact_inspect(contacts[0].org, contacts)
 
     def get_groups(self, *, manual_only=False):
         """
@@ -1237,6 +1260,9 @@ class Contact(LegacyUUIDMixin, SmartModel):
     def __str__(self):
         return self.get_display()
 
+    def __repr__(self):  # pragma: no cover
+        return f'<Contact: id={self.id} name="{self.name}">'
+
     class Meta:
         indexes = [
             # for API endpoint access
@@ -1248,6 +1274,9 @@ class Contact(LegacyUUIDMixin, SmartModel):
             models.Index(name="contacts_contact_org_modified", fields=["org", "-modified_on"]),
             # for indexing modified contacts
             models.Index(name="contacts_modified", fields=("modified_on",)),
+        ]
+        constraints = [
+            models.CheckConstraint(check=Q(status__in=("A", "B", "S", "V")), name="contact_status_valid"),
         ]
 
 
@@ -1532,7 +1561,7 @@ class ContactGroup(LegacyUUIDMixin, TembaModel, DependencyMixin):
 
         try:
             if not parsed:
-                parsed = parse_query(self.org, query)
+                parsed = mailroom.get_client().contact_parse_query(self.org, query)
 
             if not parsed.metadata.allow_as_group:
                 raise ValueError(f"Cannot use query '{query}' as a smart group")
@@ -1639,7 +1668,7 @@ class ContactGroup(LegacyUUIDMixin, TembaModel, DependencyMixin):
 
             parsed_query = None
             if group_query:
-                parsed_query = parse_query(org, group_query, parse_only=True)
+                parsed_query = mailroom.get_client().contact_parse_query(org, group_query, parse_only=True)
                 for field_ref in parsed_query.metadata.fields:
                     ContactField.get_or_create(org, user, key=field_ref["key"])
 
@@ -1657,6 +1686,19 @@ class ContactGroup(LegacyUUIDMixin, TembaModel, DependencyMixin):
         verbose_name_plural = _("Groups")
 
         constraints = [models.UniqueConstraint("org", Lower("name"), name="unique_contact_group_names")]
+
+
+class ContactNote(models.Model):
+    """
+    Note attached to a contact, with last 5 versions kept for history.
+    """
+
+    MAX_LENGTH = 10_000
+
+    contact = models.ForeignKey(Contact, on_delete=models.PROTECT, related_name="notes")
+    text = models.TextField(max_length=MAX_LENGTH, blank=True)
+    created_on = models.DateTimeField(default=timezone.now)
+    created_by = models.ForeignKey(User, on_delete=models.PROTECT, related_name="contact_notes")
 
 
 class ContactGroupCount(SquashableModel):
@@ -1815,7 +1857,7 @@ class ContactExport(ExportType):
         include_group_memberships = bool(len(group_fields) > 0)
 
         if search:
-            contact_ids = mailroom.get_client().contact_export(export.org.id, group.id, query=search)["contact_ids"]
+            contact_ids = mailroom.get_client().contact_export(export.org, group, query=search)
         else:
             contact_ids = group.contacts.using("readonly").order_by("id").values_list("id", flat=True)
 
@@ -1969,20 +2011,32 @@ class ContactImport(SmartModel):
         seen_uuids = set()
         seen_urns = set()
         num_records = 0
+        row_num = 1
 
-        for raw_row in data:
+        while True:
+            row_num += 1
+
+            try:
+                raw_row = next(data)
+            except xlrd.XLDateError:  # pragma: needs cover
+                raise ValidationError(_("Import file contains invalid date on row %(row)s."), params={"row": row_num})
+            except StopIteration:
+                break
+
             row = cls._parse_row(raw_row, len(mappings))
             uuid, urns = cls._extract_uuid_and_urns(row, mappings)
             if uuid:
                 if uuid in seen_uuids:
                     raise ValidationError(
-                        _("Import file contains duplicated contact UUID '%(uuid)s'."), params={"uuid": uuid}
+                        _("Import file contains duplicated contact UUID '%(uuid)s' on row %(row)s."),
+                        params={"uuid": uuid, "row": row_num},
                     )
                 seen_uuids.add(uuid)
             for urn in urns:
                 if urn in seen_urns:
                     raise ValidationError(
-                        _("Import file contains duplicated contact URN '%(urn)s'."), params={"urn": urn}
+                        _("Import file contains duplicated contact URN '%(urn)s' on row %(row)s."),
+                        params={"urn": urn, "row": row_num},
                     )
                 seen_urns.add(urn)
 

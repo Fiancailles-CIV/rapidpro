@@ -14,7 +14,7 @@ function onSpload(fn) {
         var eventContainer = document.querySelector('.spa-content');
         if (eventContainer) {
           eventContainer.addEventListener('temba-spa-ready', fn, {
-            once: true,
+            once: true
           });
         }
       } else {
@@ -148,7 +148,7 @@ function handleUpdateComplete() {
     content.scrollTo({
       top: 0,
       left: 0,
-      behavior: 'smooth',
+      behavior: 'smooth'
     });
   }
 }
@@ -170,7 +170,7 @@ function spaPost(url, options) {
   const requestOptions = {
     ignoreEvents: false,
     ignoreHistory: false,
-    headers: options.headers || {},
+    headers: options.headers || {}
   };
 
   if (options.queryString) {
@@ -186,6 +186,10 @@ function spaPost(url, options) {
 }
 
 function spaRequest(url, options) {
+  if (!checkForUnsavedChanges()) {
+    return;
+  }
+
   showLoading();
 
   var refererPath = window.location.pathname;
@@ -208,7 +212,7 @@ function spaRequest(url, options) {
     headers,
     ignoreEvents: ignoreEvents,
     cancel: true,
-    showErrors: !!options.showErrors,
+    showErrors: !!options.showErrors
   };
 
   if (body) {
@@ -363,9 +367,10 @@ function handleMenuClicked(event) {
   if (item.type == 'modax-button') {
     var modaxOptions = {
       disabled: false,
-      onSubmit: item.on_submit,
+      onSubmit: item.on_submit
     };
     showModax(item.name, item.href, modaxOptions);
+    return;
   }
 
   if (!item.popup && selection.length > 1 && selection[0] == 'ticket') {
@@ -378,6 +383,17 @@ function handleMenuClicked(event) {
   if (item.href && item.posterize) {
     posterize(item.href);
   }
+}
+
+function checkForUnsavedChanges() {
+  var store = document.querySelector('temba-store');
+  if (store) {
+    const unsavedChanges = store.getDirtyMessage();
+    if (unsavedChanges) {
+      return confirm(unsavedChanges);
+    }
+  }
+  return true;
 }
 
 function handleMenuChanged(event) {
@@ -400,6 +416,7 @@ function handleMenuChanged(event) {
 }
 
 function showModax(header, endpoint, modaxOptions) {
+  const lastElement = document.activeElement;
   var options = modaxOptions || {};
   var modax = document.querySelector('temba-modax#shared-modax');
   if (modax) {
@@ -427,6 +444,11 @@ function showModax(header, endpoint, modaxOptions) {
     modax.headers = { 'TEMBA-SPA': 1 };
     modax.header = header;
     modax.endpoint = endpoint;
+
+    // take our focus from the thing that invocked us
+    if (lastElement) {
+      lastElement.blur();
+    }
     modax.open = true;
   }
 }
@@ -569,4 +591,26 @@ document.addEventListener('DOMContentLoaded', function () {
   if (container) {
     container.classList.remove('initial-load');
   }
+
+  container.addEventListener('click', function (event) {
+    // get our immediate path
+    const path = event.composedPath().slice(0, 10);
+
+    // find the first anchor tag
+    const ele = path.find((ele) => ele.tagName === 'A');
+
+    if (ele) {
+      const url = new URL(ele.href);
+      event.preventDefault();
+      event.stopPropagation();
+
+      // if we are working within the app, use spaGet
+      if (url.host === window.location.host && !event.metaKey) {
+        spaGet(ele.href);
+      } else {
+        // otherwise open a new tab
+        window.open(ele.href, '_blank');
+      }
+    }
+  });
 });

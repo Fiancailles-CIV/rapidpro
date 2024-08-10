@@ -1,5 +1,5 @@
 from datetime import date, datetime, timedelta, timezone as tzone
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from openpyxl import load_workbook
 
@@ -29,7 +29,8 @@ from .tasks import squash_ticket_counts
 
 
 class TicketTest(TembaTest):
-    def test_model(self):
+    @mock_mailroom
+    def test_model(self, mr_mocks):
         topic = Topic.create(self.org, self.admin, "Sales")
         contact = self.create_contact("Bob", urns=["twitter:bobby"])
 
@@ -37,49 +38,44 @@ class TicketTest(TembaTest):
             org=self.org,
             contact=contact,
             topic=self.org.default_ticket_topic,
-            body="Where are my cookies?",
             status="O",
         )
 
         self.assertEqual(f"Ticket[uuid={ticket.uuid}, topic=General]", str(ticket))
 
         # test bulk assignment
-        with patch("temba.mailroom.client.MailroomClient.ticket_assign") as mock_assign:
-            Ticket.bulk_assign(self.org, self.admin, [ticket], self.agent)
-
-        mock_assign.assert_called_once_with(self.org.id, self.admin.id, [ticket.id], self.agent.id)
-        mock_assign.reset_mock()
+        Ticket.bulk_assign(self.org, self.admin, [ticket], self.agent)
 
         # test bulk un-assignment
-        with patch("temba.mailroom.client.MailroomClient.ticket_assign") as mock_assign:
-            Ticket.bulk_assign(self.org, self.admin, [ticket], None)
+        Ticket.bulk_assign(self.org, self.admin, [ticket], None)
 
-        mock_assign.assert_called_once_with(self.org.id, self.admin.id, [ticket.id], None)
-        mock_assign.reset_mock()
+        self.assertEqual(
+            [
+                call(self.org, self.admin, [ticket], self.agent),
+                call(self.org, self.admin, [ticket], None),
+            ],
+            mr_mocks.calls["ticket_assign"],
+        )
 
         # test bulk adding a note
-        with patch("temba.mailroom.client.MailroomClient.ticket_add_note") as mock_add_note:
-            Ticket.bulk_add_note(self.org, self.admin, [ticket], "please handle")
+        Ticket.bulk_add_note(self.org, self.admin, [ticket], "please handle")
 
-        mock_add_note.assert_called_once_with(self.org.id, self.admin.id, [ticket.id], "please handle")
+        self.assertEqual([call(self.org, self.admin, [ticket], "please handle")], mr_mocks.calls["ticket_add_note"])
 
         # test bulk changing topic
-        with patch("temba.mailroom.client.MailroomClient.ticket_change_topic") as mock_change_topic:
-            Ticket.bulk_change_topic(self.org, self.admin, [ticket], topic)
+        Ticket.bulk_change_topic(self.org, self.admin, [ticket], topic)
 
-        mock_change_topic.assert_called_once_with(self.org.id, self.admin.id, [ticket.id], topic.id)
+        self.assertEqual([call(self.org, self.admin, [ticket], topic)], mr_mocks.calls["ticket_change_topic"])
 
         # test bulk closing
-        with patch("temba.mailroom.client.MailroomClient.ticket_close") as mock_close:
-            Ticket.bulk_close(self.org, self.admin, [ticket], force=True)
+        Ticket.bulk_close(self.org, self.admin, [ticket], force=True)
 
-        mock_close.assert_called_once_with(self.org.id, self.admin.id, [ticket.id], force=True)
+        self.assertEqual([call(self.org, self.admin, [ticket], force=True)], mr_mocks.calls["ticket_close"])
 
         # test bulk re-opening
-        with patch("temba.mailroom.client.MailroomClient.ticket_reopen") as mock_reopen:
-            Ticket.bulk_reopen(self.org, self.admin, [ticket])
+        Ticket.bulk_reopen(self.org, self.admin, [ticket])
 
-        mock_reopen.assert_called_once_with(self.org.id, self.admin.id, [ticket.id])
+        self.assertEqual([call(self.org, self.admin, [ticket])], mr_mocks.calls["ticket_reopen"])
 
     def test_allowed_assignees(self):
         self.assertEqual({self.admin, self.editor, self.agent}, set(Ticket.get_allowed_assignees(self.org)))
@@ -96,12 +92,12 @@ class TicketTest(TembaTest):
         org2_general = self.org2.default_ticket_topic
         org2_contact = self.create_contact("Bob", urns=["twitter:bobby"], org=self.org2)
 
-        t1 = self.create_ticket(contact1, "Test 1", topic=general)
-        t2 = self.create_ticket(contact2, "Test 2", topic=general)
-        t3 = self.create_ticket(contact1, "Test 3", topic=general)
-        t4 = self.create_ticket(contact2, "Test 4", topic=cats)
-        t5 = self.create_ticket(contact1, "Test 5", topic=cats)
-        t6 = self.create_ticket(org2_contact, "Test 6", topic=org2_general)
+        t1 = self.create_ticket(contact1, topic=general)
+        t2 = self.create_ticket(contact2, topic=general)
+        t3 = self.create_ticket(contact1, topic=general)
+        t4 = self.create_ticket(contact2, topic=cats)
+        t5 = self.create_ticket(contact1, topic=cats)
+        t6 = self.create_ticket(org2_contact, topic=org2_general)
 
         def assert_counts(
             org, *, assignee_open: dict, assignee_closed: dict, topic_open: dict, topic_closed: dict, contacts: dict
@@ -244,6 +240,27 @@ class TopicCRUDLTest(TembaTest, CRUDLTestMixin):
     def setUp(self):
         super().setUp()
 
+    def test_create(self):
+        create_url = reverse("tickets.topic_create")
+
+        self.assertRequestDisallowed(create_url, [None, self.agent, self.user])
+        self.assertCreateFetch(create_url, [self.editor, self.admin], form_fields=("name",))
+
+        self.assertCreateSubmit(
+            create_url,
+            self.admin,
+            {"name": ""},
+            form_errors={"name": "This field is required."},
+        )
+
+        self.assertCreateSubmit(
+            create_url,
+            self.admin,
+            {"name": "Hot Topic"},
+            new_obj_query=Topic.objects.filter(name="Hot Topic", is_system=False),
+            success_status=302,
+        )
+
     def test_update(self):
         system_topic = Topic.objects.filter(org=self.org, is_system=True).first()
         user_topic = Topic.objects.create(org=self.org, name="Hot Topic", created_by=self.admin, modified_by=self.admin)
@@ -278,6 +295,22 @@ class TopicCRUDLTest(TembaTest, CRUDLTestMixin):
         user_topic.refresh_from_db()
         self.assertEqual(user_topic.name, "Boring Tickets")
 
+    def test_delete(self):
+        system_topic = Topic.objects.filter(org=self.org, is_system=True).first()
+        user_topic = Topic.objects.create(org=self.org, name="Hot Topic", created_by=self.admin, modified_by=self.admin)
+
+        delete_url = reverse("tickets.topic_delete", args=[user_topic.uuid])
+        self.assertRequestDisallowed(delete_url, [None, self.user, self.agent, self.admin2])
+
+        response = self.assertDeleteFetch(delete_url, [self.editor, self.admin])
+        self.assertContains(response, "You are about to delete")
+
+        # submit to delete it
+        response = self.assertDeleteSubmit(delete_url, self.admin, object_deactivated=user_topic, success_status=302)
+
+        # we should have been redirected to the system topic
+        self.assertEqual(f"/ticket/{system_topic.uuid}/open/", response.url)
+
 
 class TicketCRUDLTest(TembaTest, CRUDLTestMixin):
     def setUp(self):
@@ -287,7 +320,7 @@ class TicketCRUDLTest(TembaTest, CRUDLTestMixin):
 
     def test_list(self):
         list_url = reverse("tickets.ticket_list")
-        ticket = self.create_ticket(self.contact, "Test 1", assignee=self.admin)
+        ticket = self.create_ticket(self.contact, assignee=self.admin)
 
         # just a placeholder view for frontend components
         self.assertRequestDisallowed(list_url, [None])
@@ -345,34 +378,33 @@ class TicketCRUDLTest(TembaTest, CRUDLTestMixin):
         self.assertContentMenu(deep_link, self.admin, [])
 
     def test_update(self):
-        ticket = self.create_ticket(self.contact, "Test 1", assignee=self.admin)
+        ticket = self.create_ticket(self.contact, assignee=self.admin)
 
         update_url = reverse("tickets.ticket_update", args=[ticket.uuid])
 
         self.assertRequestDisallowed(update_url, [None, self.user, self.admin2])
-        self.assertUpdateFetch(update_url, [self.agent, self.editor, self.admin], form_fields=["topic", "body"])
+        self.assertUpdateFetch(update_url, [self.agent, self.editor, self.admin], form_fields=["topic"])
 
         user_topic = Topic.objects.create(org=self.org, name="Hot Topic", created_by=self.admin, modified_by=self.admin)
 
         # edit successfully
-        self.assertUpdateSubmit(
-            update_url, self.admin, {"topic": user_topic.id, "body": "This is silly"}, success_status=302
-        )
+        self.assertUpdateSubmit(update_url, self.admin, {"topic": user_topic.id}, success_status=302)
 
         ticket.refresh_from_db()
         self.assertEqual(user_topic, ticket.topic)
-        self.assertEqual("This is silly", ticket.body)
 
     def test_menu(self):
         menu_url = reverse("tickets.ticket_menu")
 
-        self.create_ticket(self.contact, "Test 1", assignee=self.admin)
-        self.create_ticket(self.contact, "Test 2", assignee=self.admin)
-        self.create_ticket(self.contact, "Test 3", assignee=None)
-        self.create_ticket(self.contact, "Test 4", closed_on=timezone.now())
+        self.create_ticket(self.contact, assignee=self.admin)
+        self.create_ticket(self.contact, assignee=self.admin)
+        self.create_ticket(self.contact, assignee=None)
+        self.create_ticket(self.contact, closed_on=timezone.now())
 
         self.assertRequestDisallowed(menu_url, [None])
-        self.assertPageMenu(menu_url, self.admin, ["My Tickets (2)", "Unassigned (1)", "All (3)", "General (3)"])
+        self.assertPageMenu(
+            menu_url, self.admin, ["My Tickets (2)", "Unassigned (1)", "All (3)", "Export", "New Topic", "General (3)"]
+        )
         self.assertPageMenu(menu_url, self.agent, ["My Tickets (0)", "Unassigned (1)", "All (3)", "General (3)"])
 
     @mock_mailroom
@@ -386,7 +418,7 @@ class TicketCRUDLTest(TembaTest, CRUDLTestMixin):
         contact3 = self.create_contact("Anne", phone="125", last_seen_on=timezone.now())
         self.create_contact("Mary No tickets", phone="126", last_seen_on=timezone.now())
         self.create_contact("Mr Other Org", phone="126", last_seen_on=timezone.now(), org=self.org2)
-        topic = Topic.objects.filter(org=self.org).first()
+        topic = Topic.objects.filter(org=self.org, is_system=True).first()
 
         open_url = reverse("tickets.ticket_folder", kwargs={"folder": "all", "status": "open"})
         closed_url = reverse("tickets.ticket_folder", kwargs={"folder": "all", "status": "closed"})
@@ -401,38 +433,34 @@ class TicketCRUDLTest(TembaTest, CRUDLTestMixin):
             expected_tickets = [str(t.uuid) for t in tickets]
             self.assertEqual(expected_tickets, actual_tickets)
 
-        # general topic gets export
-        self.assertContentMenu(system_topic_url, self.admin, ["Export"])
+        # system topic has no menu options
+        self.assertContentMenu(system_topic_url, self.admin, [])
 
         # user topic gets edit too
-        self.assertContentMenu(user_topic_url, self.admin, ["Edit", "-", "Export"])
+        self.assertContentMenu(user_topic_url, self.admin, ["Edit", "Delete"])
 
         # no tickets yet so no contacts returned
         response = self.client.get(open_url)
         assert_tickets(response, [])
 
-        # contact 1 has two open tickets
-        c1_t1 = self.create_ticket(contact1, "Question 1")
+        # contact 1 has two open tickets and some messages
+        c1_t1 = self.create_ticket(contact1)
         # assign it
         c1_t1.assign(self.admin, assignee=self.admin)
-        c1_t2 = self.create_ticket(contact1, "Question 2")
-
-        # give contact1 and old style broadcast message that doesn't have created_by set
+        c1_t2 = self.create_ticket(contact1)
         self.create_incoming_msg(contact1, "I have an issue")
-        c1_msg1 = self.create_broadcast(self.admin, "We can help", contacts=[contact1]).msgs.first()
-        c1_msg1.created_by = None
-        c1_msg1.save(update_fields=("created_by",))
+        self.create_outgoing_msg(contact1, "We can help", created_by=self.admin)
 
         # contact 2 has an open ticket and a closed ticket
-        c2_t1 = self.create_ticket(contact2, "Question 3")
-        c2_t2 = self.create_ticket(contact2, "Question 4", closed_on=timezone.now())
+        c2_t1 = self.create_ticket(contact2)
+        c2_t2 = self.create_ticket(contact2, closed_on=timezone.now())
 
         self.create_incoming_msg(contact2, "Anyone there?")
         self.create_incoming_msg(contact2, "Hello?")
 
         # contact 3 has two closed tickets
-        c3_t1 = self.create_ticket(contact3, "Question 5", closed_on=timezone.now())
-        c3_t2 = self.create_ticket(contact3, "Question 6", closed_on=timezone.now())
+        c3_t1 = self.create_ticket(contact3, closed_on=timezone.now())
+        c3_t2 = self.create_ticket(contact3, closed_on=timezone.now())
 
         self.create_outgoing_msg(contact3, "Yes", created_by=self.agent)
 
@@ -460,7 +488,6 @@ class TicketCRUDLTest(TembaTest, CRUDLTestMixin):
                         "uuid": str(contact2.tickets.filter(status="O").first().uuid),
                         "assignee": None,
                         "topic": {"uuid": matchers.UUID4String(), "name": "General"},
-                        "body": "Question 3",
                         "last_activity_on": matchers.ISODate(),
                         "closed_on": None,
                     },
@@ -481,7 +508,6 @@ class TicketCRUDLTest(TembaTest, CRUDLTestMixin):
                         "uuid": str(joes_open_tickets[0].uuid),
                         "assignee": None,
                         "topic": {"uuid": matchers.UUID4String(), "name": "General"},
-                        "body": "Question 2",
                         "last_activity_on": matchers.ISODate(),
                         "closed_on": None,
                     },
@@ -507,7 +533,6 @@ class TicketCRUDLTest(TembaTest, CRUDLTestMixin):
                             "email": "admin@nyaruka.com",
                         },
                         "topic": {"uuid": matchers.UUID4String(), "name": "General"},
-                        "body": "Question 1",
                         "last_activity_on": matchers.ISODate(),
                         "closed_on": None,
                     },
@@ -559,7 +584,6 @@ class TicketCRUDLTest(TembaTest, CRUDLTestMixin):
                     "uuid": str(c3_t2.uuid),
                     "assignee": None,
                     "topic": {"uuid": matchers.UUID4String(), "name": "General"},
-                    "body": "Question 6",
                     "last_activity_on": matchers.ISODate(),
                     "closed_on": matchers.ISODate(),
                 },
@@ -578,7 +602,7 @@ class TicketCRUDLTest(TembaTest, CRUDLTestMixin):
 
     @mock_mailroom
     def test_note(self, mr_mocks):
-        ticket = self.create_ticket(self.contact, "Ticket 1")
+        ticket = self.create_ticket(self.contact)
 
         update_url = reverse("tickets.ticket_note", args=[ticket.uuid])
 
@@ -790,38 +814,24 @@ class TicketExportTest(TembaTest):
 
         # create an open ticket for nate, opened 30 days ago
         ticket1 = self.create_ticket(
-            nate,
-            body="Y'ello",
-            topic=topic,
-            assignee=assignee,
-            opened_on=timezone.now() - timedelta(days=30),
+            nate, topic=topic, assignee=assignee, opened_on=timezone.now() - timedelta(days=30)
         )
         # create an open ticket for jamie, opened 25 days ago
         ticket2 = self.create_ticket(
-            jamie, body="Hi", topic=topic, assignee=assignee, opened_on=timezone.now() - timedelta(days=25)
+            jamie, topic=topic, assignee=assignee, opened_on=timezone.now() - timedelta(days=25)
         )
 
         # create a closed ticket for roy, opened yesterday
         ticket3 = self.create_ticket(
-            roy,
-            body="Hello",
-            topic=topic,
-            assignee=assignee,
-            opened_on=timezone.now() - timedelta(days=1),
-            closed_on=timezone.now(),
+            roy, topic=topic, assignee=assignee, opened_on=timezone.now() - timedelta(days=1), closed_on=timezone.now()
         )
         # create a closed ticket for sam, opened today
         ticket4 = self.create_ticket(
-            sam,
-            body="Yo",
-            topic=topic,
-            assignee=assignee,
-            opened_on=timezone.now(),
-            closed_on=timezone.now(),
+            sam, topic=topic, assignee=assignee, opened_on=timezone.now(), closed_on=timezone.now()
         )
 
         # create a ticket on another org for rebecca
-        self.create_ticket(self.create_contact("Rebecca", urns=["twitter:rwaddingham"], org=self.org2), "Stuff")
+        self.create_ticket(self.create_contact("Rebecca", urns=["twitter:rwaddingham"], org=self.org2))
 
         # check requesting export for last 90 days
         with self.mockReadOnly(assert_models={Ticket, ContactURN}):
@@ -1042,7 +1052,7 @@ class TopicTest(TembaTest):
 
         self.assertEqual("Sales", topic1.name)
         self.assertEqual("Sales", str(topic1))
-        self.assertEqual(f'<Topic: uuid={topic1.uuid} name="Sales">', repr(topic1))
+        self.assertEqual(f'<Topic: id={topic1.id} name="Sales">', repr(topic1))
 
         # try to create with invalid name
         with self.assertRaises(AssertionError):
@@ -1168,6 +1178,15 @@ class TopicTest(TembaTest):
         with self.assertRaises(AssertionError):
             self.org.default_ticket_topic.release(self.admin)
 
+        # can't release a topic with tickets
+        ticket = self.create_ticket(self.create_contact("Bob"), topic=topic1)
+        with self.assertRaises(AssertionError):
+            topic1.release(self.admin)
+
+        # can delete a topic with no tickets
+        ticket.delete()
+        topic1.release(self.admin)
+
 
 class TeamTest(TembaTest):
     def test_create(self):
@@ -1177,7 +1196,7 @@ class TeamTest(TembaTest):
 
         self.assertEqual("Sales", team1.name)
         self.assertEqual("Sales", str(team1))
-        self.assertEqual(f'<Team: uuid={team1.uuid} name="Sales">', repr(team1))
+        self.assertEqual(f'<Team: id={team1.id} name="Sales">', repr(team1))
 
         self.assertEqual({self.admin, self.agent}, set(team1.get_users()))
 
@@ -1282,14 +1301,14 @@ class TicketDailyCountTest(TembaTest):
         workbook = export_ticket_stats(self.org, date(2022, 4, 30), date(2022, 5, 6))
         self.assertEqual(["Tickets"], workbook.sheetnames)
         self.assertExcelRow(
-            workbook.active, 1, ["", "Opened", "Replies", "Reply Time (Secs)"] + ["Assigned", "Replies"] * 5
+            workbook.active, 1, ["", "Opened", "Replies", "Reply Time (Secs)"] + ["Assigned", "Replies"] * 4
         )
-        self.assertExcelRow(workbook.active, 2, [date(2022, 4, 30), 1, 0, "", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
-        self.assertExcelRow(workbook.active, 3, [date(2022, 5, 1), 0, 0, "", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
-        self.assertExcelRow(workbook.active, 4, [date(2022, 5, 2), 0, 0, "", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
-        self.assertExcelRow(workbook.active, 5, [date(2022, 5, 3), 1, 1, "", 1, 1, 0, 0, 0, 0, 0, 0, 0, 0])
-        self.assertExcelRow(workbook.active, 6, [date(2022, 5, 4), 0, 2, "", 0, 0, 0, 1, 0, 1, 0, 0, 0, 0])
-        self.assertExcelRow(workbook.active, 7, [date(2022, 5, 5), 1, 3, "", 0, 2, 0, 1, 0, 0, 0, 0, 0, 0])
+        self.assertExcelRow(workbook.active, 2, [date(2022, 4, 30), 1, 0, "", 0, 0, 0, 0, 0, 0, 0, 0])
+        self.assertExcelRow(workbook.active, 3, [date(2022, 5, 1), 0, 0, "", 0, 0, 0, 0, 0, 0, 0, 0])
+        self.assertExcelRow(workbook.active, 4, [date(2022, 5, 2), 0, 0, "", 0, 0, 0, 0, 0, 0, 0, 0])
+        self.assertExcelRow(workbook.active, 5, [date(2022, 5, 3), 1, 1, "", 1, 1, 0, 0, 0, 0, 0, 0])
+        self.assertExcelRow(workbook.active, 6, [date(2022, 5, 4), 0, 2, "", 0, 0, 0, 1, 0, 1, 0, 0])
+        self.assertExcelRow(workbook.active, 7, [date(2022, 5, 5), 1, 3, "", 0, 2, 0, 1, 0, 0, 0, 0])
 
     def _record_opening(self, org, d: date):
         TicketDailyCount.objects.create(count_type=TicketDailyCount.TYPE_OPENING, scope=f"o:{org.id}", day=d, count=1)
@@ -1354,12 +1373,12 @@ class TicketDailyTimingTest(TembaTest):
         workbook = export_ticket_stats(self.org, date(2022, 4, 30), date(2022, 5, 4))
         self.assertEqual(["Tickets"], workbook.sheetnames)
         self.assertExcelRow(
-            workbook.active, 1, ["", "Opened", "Replies", "Reply Time (Secs)"] + ["Assigned", "Replies"] * 5
+            workbook.active, 1, ["", "Opened", "Replies", "Reply Time (Secs)"] + ["Assigned", "Replies"] * 4
         )
-        self.assertExcelRow(workbook.active, 2, [date(2022, 4, 30), 0, 0, 60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
-        self.assertExcelRow(workbook.active, 3, [date(2022, 5, 1), 0, 0, 120, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
-        self.assertExcelRow(workbook.active, 4, [date(2022, 5, 2), 0, 0, 40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
-        self.assertExcelRow(workbook.active, 5, [date(2022, 5, 3), 0, 0, "", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        self.assertExcelRow(workbook.active, 2, [date(2022, 4, 30), 0, 0, 60, 0, 0, 0, 0, 0, 0, 0, 0])
+        self.assertExcelRow(workbook.active, 3, [date(2022, 5, 1), 0, 0, 120, 0, 0, 0, 0, 0, 0, 0, 0])
+        self.assertExcelRow(workbook.active, 4, [date(2022, 5, 2), 0, 0, 40, 0, 0, 0, 0, 0, 0, 0, 0])
+        self.assertExcelRow(workbook.active, 5, [date(2022, 5, 3), 0, 0, "", 0, 0, 0, 0, 0, 0, 0, 0])
 
     def _record_first_reply(self, org, d: date, seconds: int):
         TicketDailyTiming.objects.create(

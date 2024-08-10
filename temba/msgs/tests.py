@@ -1,7 +1,6 @@
 import json
-from collections import OrderedDict
 from datetime import date, datetime, timedelta, timezone as tzone
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from openpyxl import load_workbook
 
@@ -13,7 +12,6 @@ from django.utils import timezone
 from temba import mailroom
 from temba.archives.models import Archive
 from temba.channels.models import ChannelCount, ChannelLog
-from temba.contacts.search.omnibox import omnibox_serialize
 from temba.flows.models import Flow
 from temba.msgs.models import (
     Attachment,
@@ -30,15 +28,17 @@ from temba.msgs.models import (
 from temba.msgs.views import ScheduleForm
 from temba.orgs.models import Export
 from temba.schedules.models import Schedule
-from temba.tests import CRUDLTestMixin, TembaTest, mock_mailroom, mock_uuids
+from temba.templates.models import TemplateTranslation
+from temba.tests import CRUDLTestMixin, MigrationTest, TembaTest, mock_mailroom, mock_uuids
 from temba.tests.engine import MockSessionWriter
 from temba.tests.s3 import MockS3Client, jsonlgz_encode
 from temba.tickets.models import Ticket
 from temba.utils import s3
 from temba.utils.compose import compose_deserialize_attachments, compose_serialize
+from temba.utils.fields import ContactSearchWidget
 from temba.utils.views import TEMBA_MENU_SELECTION
 
-from .tasks import fail_old_messages, squash_msg_counts
+from .tasks import fail_old_android_messages, squash_msg_counts
 
 
 class AttachmentTest(TembaTest):
@@ -421,7 +421,7 @@ class MsgTest(TembaTest, CRUDLTestMixin):
         assertReleaseCount("I", Msg.STATUS_HANDLED, Msg.VISIBILITY_ARCHIVED, None, SystemLabel.TYPE_ARCHIVED)
         assertReleaseCount("I", Msg.STATUS_HANDLED, Msg.VISIBILITY_VISIBLE, flow, SystemLabel.TYPE_FLOWS)
 
-    def test_fail_old_messages(self):
+    def test_fail_old_android_messages(self):
         msg1 = self.create_outgoing_msg(self.joe, "Hello", status=Msg.STATUS_QUEUED)
         msg2 = self.create_outgoing_msg(
             self.joe, "Hello", status=Msg.STATUS_QUEUED, created_on=timezone.now() - timedelta(days=8)
@@ -433,7 +433,7 @@ class MsgTest(TembaTest, CRUDLTestMixin):
             self.joe, "Hello", status=Msg.STATUS_SENT, created_on=timezone.now() - timedelta(days=8)
         )
 
-        fail_old_messages()
+        fail_old_android_messages()
 
         def assert_status(msg, status):
             msg.refresh_from_db()
@@ -471,7 +471,7 @@ class MsgTest(TembaTest, CRUDLTestMixin):
         # create a message which references a flow and a ticket
         flow = self.create_flow("Flow")
         contact = self.create_contact("Ann", phone="+250788000001")
-        ticket = self.create_ticket(contact, "Help")
+        ticket = self.create_ticket(contact)
         msg = self.create_outgoing_msg(contact, "Hi", flow=flow, ticket=ticket)
 
         # both Msg.flow and Msg.ticket are unconstrained so we shuld be able to delete these
@@ -571,8 +571,8 @@ class MsgCRUDLTest(TembaTest, CRUDLTestMixin):
         msg1.refresh_from_db()
         self.assertEqual({label1, label3}, set(msg1.labels.all()))
 
-        self.assertContentMenu(inbox_url, self.user, ["Download"])
-        self.assertContentMenu(inbox_url, self.admin, ["New Broadcast", "New Label", "Download"])
+        self.assertContentMenu(inbox_url, self.user, ["Export"])
+        self.assertContentMenu(inbox_url, self.admin, ["Send", "New Label", "Export"])
 
     def test_flows(self):
         flow = self.create_flow("Test")
@@ -643,7 +643,7 @@ class MsgCRUDLTest(TembaTest, CRUDLTestMixin):
         # create a single message broadcast that's sent but it's message is still not sent
         broadcast1 = self.create_broadcast(
             self.admin,
-            "How is it going?",
+            {"eng": {"text": "How is it going?"}},
             contacts=[contact1],
             status=Broadcast.STATUS_SENT,
             msg_status=Msg.STATUS_INITIALIZING,
@@ -667,18 +667,22 @@ class MsgCRUDLTest(TembaTest, CRUDLTestMixin):
         group = self.create_group("Testers", contacts=[contact2, contact3])
         broadcast2 = self.create_broadcast(
             self.admin,
-            "kLab is awesome",
+            {"eng": {"text": "kLab is awesome"}},
             contacts=[contact4],
             groups=[group],
             msg_status=Msg.STATUS_QUEUED,
         )
         msg4, msg3, msg2 = broadcast2.msgs.order_by("-id")
 
-        broadcast3 = Broadcast.create(self.channel.org, self.admin, {"eng": "Pending broadcast"}, contacts=[contact4])
-        broadcast4 = Broadcast.create(self.channel.org, self.admin, {"eng": "Scheduled broadcast"}, contacts=[contact4])
-
-        broadcast4.schedule = Schedule.create(self.org, timezone.now(), Schedule.REPEAT_DAILY)
-        broadcast4.save(update_fields=("schedule",))
+        broadcast3 = self.create_broadcast(
+            self.admin, {"eng": {"text": "Pending broadcast"}}, contacts=[contact4], status="Q"
+        )
+        self.create_broadcast(
+            self.admin,
+            {"eng": {"text": "Scheduled broadcast"}},
+            contacts=[contact4],
+            schedule=Schedule.create(self.org, timezone.now(), Schedule.REPEAT_DAILY),
+        )
 
         response = self.assertListFetch(outbox_url, [self.admin], context_objects=[msg4, msg3, msg2, msg1])
 
@@ -725,15 +729,15 @@ class MsgCRUDLTest(TembaTest, CRUDLTestMixin):
         response = self.client.get(sent_url + "?search=joe")
         self.assertEqual([msg1, msg2], list(response.context_data["object_list"]))
 
-    @patch("temba.mailroom.client.MailroomClient.msg_resend")
-    def test_failed(self, mock_msg_resend):
+    @mock_mailroom
+    def test_failed(self, mr_mocks):
         contact1 = self.create_contact("Joe Blow", phone="+250788000001")
         msg1 = self.create_outgoing_msg(contact1, "message number 1", status="F")
 
         failed_url = reverse("msgs.msg_failed")
 
         # create broadcast and fail the only message
-        broadcast = self.create_broadcast(self.admin, "message number 2", contacts=[contact1])
+        broadcast = self.create_broadcast(self.admin, {"eng": {"text": "message number 2"}}, contacts=[contact1])
         broadcast.get_messages().update(status="F")
         msg2 = broadcast.get_messages()[0]
 
@@ -756,7 +760,7 @@ class MsgCRUDLTest(TembaTest, CRUDLTestMixin):
         # resend some messages
         self.client.post(failed_url, {"action": "resend", "objects": [msg2.id]})
 
-        mock_msg_resend.assert_called_once_with(self.org.id, [msg2.id])
+        self.assertEqual([call(self.org, [msg2])], mr_mocks.calls["msg_resend"])
 
         # suspended orgs don't see resend as option
         self.org.is_suspended = True
@@ -800,7 +804,7 @@ class MsgCRUDLTest(TembaTest, CRUDLTestMixin):
         self.assertEqual(f"/msg/labels/{label3.uuid}", response.headers[TEMBA_MENU_SELECTION])
         self.assertEqual(200, response.status_code)
         self.assertEqual(("label",), response.context["actions"])
-        self.assertContentMenu(label3_url, self.user, ["Download", "Usages"])  # no update or delete
+        self.assertContentMenu(label3_url, self.user, ["Export", "Usages"])  # no update or delete
 
         # check that non-visible messages are excluded, and messages and ordered newest to oldest
         self.assertEqual([msg6, msg3, msg2, msg1], list(response.context["object_list"]))
@@ -810,7 +814,7 @@ class MsgCRUDLTest(TembaTest, CRUDLTestMixin):
         self.assertEqual({msg1, msg6}, set(response.context_data["object_list"]))
 
         # check admin users see edit and delete options for labels
-        self.assertContentMenu(label1_url, self.admin, ["Edit", "Download", "Usages", "Delete"])
+        self.assertContentMenu(label1_url, self.admin, ["Edit", "Delete", "-", "Export", "Usages"])
 
     def test_export(self):
         export_url = reverse("msgs.msg_export")
@@ -1784,12 +1788,12 @@ class BroadcastTest(TembaTest):
         self.create_incoming_msg(self.frank, "Bonjour")
 
         # create a broadcast which is a response to an incoming message
-        self.create_broadcast(self.user, self.create_translations("Noted"), contacts=[self.joe])
+        self.create_broadcast(self.user, {"eng": {"text": "Noted"}}, contacts=[self.joe])
 
         # create a broadcast which is to several contacts
         broadcast2 = self.create_broadcast(
             self.user,
-            "Very old broadcast",
+            {"eng": {"text": "Very old broadcast"}},
             groups=[self.joe_and_frank],
             contacts=[self.kevin, self.lucy],
         )
@@ -1840,51 +1844,49 @@ class BroadcastTest(TembaTest):
         self.assertEqual(0, ChannelCount.get_day_count(self.twitter, ChannelCount.INCOMING_MSG_TYPE, today))
         self.assertEqual(1, ChannelCount.get_day_count(self.twitter, ChannelCount.OUTGOING_MSG_TYPE, today))
 
-    def test_model(self):
+    @mock_mailroom
+    def test_model(self, mr_mocks):
         schedule = Schedule.create(self.org, timezone.now(), Schedule.REPEAT_MONTHLY)
-        broadcast1 = Broadcast.create(
+
+        bcast2 = Broadcast.create(
             self.org,
             self.user,
-            {"eng": "Hello everyone", "spa": "Hola a todos", "fra": "Salut à tous"},
+            {"eng": {"text": "Hello everyone"}, "spa": {"text": "Hola a todos"}, "fra": {"text": "Salut à tous"}},
             base_language="eng",
             groups=[self.joe_and_frank],
             contacts=[self.kevin, self.lucy],
             schedule=schedule,
         )
-        self.assertEqual("Q", broadcast1.status)
-        self.assertEqual(True, broadcast1.is_active)
-
-        with patch("temba.mailroom.queue_broadcast") as mock_queue_broadcast:
-            broadcast1.send_async()
-
-            mock_queue_broadcast.assert_called_once_with(broadcast1)
+        self.assertEqual("Q", bcast2.status)
+        self.assertTrue(bcast2.is_active)
 
         # create a broadcast that looks like it has been sent
-        broadcast2 = self.create_broadcast(self.admin, "Hi everyone", contacts=[self.kevin, self.lucy])
+        bcast3 = self.create_broadcast(self.admin, {"eng": {"text": "Hi everyone"}}, contacts=[self.kevin, self.lucy])
 
-        self.assertEqual(2, broadcast2.msgs.count())
-        self.assertEqual(2, broadcast2.get_message_count())
+        self.assertEqual(2, bcast3.msgs.count())
+        self.assertEqual(2, bcast3.get_message_count())
 
         self.assertEqual(2, Broadcast.objects.count())
         self.assertEqual(2, Msg.objects.count())
         self.assertEqual(1, Schedule.objects.count())
 
-        broadcast1.delete(self.admin, soft=True)
+        bcast2.delete(self.admin, soft=True)
 
         self.assertEqual(2, Broadcast.objects.count())
         self.assertEqual(2, Msg.objects.count())
         self.assertEqual(0, Schedule.objects.count())  # schedule actually deleted
 
         # schedule should also be inactive
-        broadcast1.delete(self.admin, soft=False)
-        broadcast2.delete(self.admin, soft=False)
+        bcast2.delete(self.admin, soft=False)
+        bcast3.delete(self.admin, soft=False)
 
         self.assertEqual(0, Broadcast.objects.count())
         self.assertEqual(0, Msg.objects.count())
         self.assertEqual(0, Schedule.objects.count())
 
+        # can't create broadcast with no recipients
         with self.assertRaises(AssertionError):
-            Broadcast.create(self.org, self.user, {"und": {"text": "no recipients"}})
+            Broadcast.create(self.org, self.user, {"und": {"text": "no recipients"}}, base_language="und")
 
     @mock_mailroom
     def test_preview(self, mr_mocks):
@@ -1924,15 +1926,13 @@ class BroadcastTest(TembaTest):
         spa_attachments = [attachments[1]]
         fra_attachments = [attachments[2]]
 
-        broadcast = Broadcast.create(
-            self.org,
+        broadcast = self.create_broadcast(
             self.user,
             translations={
                 "eng": {"text": eng_text, "attachments": eng_attachments},
                 "spa": {"text": spa_text, "attachments": spa_attachments},
                 "fra": {"text": fra_text, "attachments": fra_attachments},
             },
-            base_language="eng",
             groups=[self.joe_and_frank],
             contacts=[self.kevin, self.lucy],
             schedule=Schedule.create(self.org, timezone.now(), Schedule.REPEAT_MONTHLY),
@@ -1966,44 +1966,6 @@ class BroadcastTest(TembaTest):
         self.assertEqual(f'<Broadcast: id={broadcast.id} text="Hola a todos">', repr(broadcast))
 
 
-def get_broadcast_form_data(
-    org,
-    *,
-    contacts=[],
-    translations=None,
-    send_when=ScheduleForm.SEND_LATER,
-    start_datetime="",
-    repeat_period="",
-    repeat_days_of_week="",
-):
-    payload = OrderedDict(
-        [
-            ("target", {"omnibox": omnibox_serialize(org, groups=[], contacts=contacts, json_encode=True)}),
-            (
-                "compose",
-                {"compose": compose_serialize(translations, json_encode=True)} if translations else None,
-            ),
-            (
-                "schedule",
-                (
-                    {
-                        "send_when": send_when,
-                        "start_datetime": start_datetime,
-                        "repeat_period": repeat_period,
-                        "repeat_days_of_week": repeat_days_of_week,
-                    }
-                    if send_when
-                    else None
-                ),
-            ),
-        ]
-    )
-
-    if send_when == ScheduleForm.SEND_NOW:
-        payload["schedule"] = {"send_when": send_when, "repeat_period": Schedule.REPEAT_NEVER}
-    return payload
-
-
 class BroadcastCRUDLTest(TembaTest, CRUDLTestMixin):
     def setUp(self):
         super().setUp()
@@ -2012,8 +1974,82 @@ class BroadcastCRUDLTest(TembaTest, CRUDLTestMixin):
         self.frank = self.create_contact("Frank Blow", urns=["tel:+12025550195"])
         self.joe_and_frank = self.create_group("Joe and Frank", [self.joe, self.frank])
 
-    def test_create(self):
+    def _form_data(
+        self,
+        *,
+        translations,
+        contacts=(),
+        advanced=False,
+        query=None,
+        optin=None,
+        template=None,
+        variables=[],
+        send_when=ScheduleForm.SEND_LATER,
+        start_datetime="",
+        repeat_period="",
+        repeat_days_of_week="",
+    ):
+        # UI puts optin in translations
+        if translations:
+            first_lang = next(iter(translations))
+            translations[first_lang]["optin"] = {"uuid": str(optin.uuid), "name": optin.name} if optin else None
+
+        if template:
+            translation = template.translations.all().first()
+            first_lang = next(iter(translations))
+            translations[first_lang]["template"] = str(template.uuid)
+            translations[first_lang]["variables"] = variables
+            translations[first_lang]["locale"] = translation.locale
+
+        recipients = ContactSearchWidget.get_recipients(contacts)
+        contact_search = {"recipients": recipients, "advanced": advanced, "query": query, "exclusions": {}}
+
+        payload = {
+            "target": {"contact_search": json.dumps(contact_search)},
+            "compose": {"compose": compose_serialize(translations, json_encode=True)} if translations else None,
+            "schedule": (
+                {
+                    "send_when": send_when,
+                    "start_datetime": start_datetime,
+                    "repeat_period": repeat_period,
+                    "repeat_days_of_week": repeat_days_of_week,
+                }
+                if send_when
+                else None
+            ),
+        }
+
+        if send_when == ScheduleForm.SEND_NOW:
+            payload["schedule"] = {"send_when": send_when, "repeat_period": Schedule.REPEAT_NEVER}
+        return payload
+
+    @mock_mailroom
+    def test_create(self, mr_mocks):
         create_url = reverse("msgs.broadcast_create")
+
+        template = self.create_template(
+            "Hello World",
+            [
+                TemplateTranslation(
+                    channel=self.channel,
+                    locale="eng-US",
+                    status=TemplateTranslation.STATUS_APPROVED,
+                    external_id="1003",
+                    external_locale="en_US",
+                    namespace="",
+                    components=[
+                        {"name": "header", "type": "header/media", "variables": {"1": 0}},
+                        {
+                            "name": "body",
+                            "type": "body/text",
+                            "content": "Hello {{1}}",
+                            "variables": {"1": 1},
+                        },
+                    ],
+                    variables=[{"type": "image"}, {"type": "text"}],
+                )
+            ],
+        )
 
         text = "I hope you are having a great day"
         media = Media.from_upload(
@@ -2024,21 +2060,34 @@ class BroadcastCRUDLTest(TembaTest, CRUDLTestMixin):
         )
 
         self.assertRequestDisallowed(create_url, [None, self.user, self.agent])
-        self.assertCreateFetch(create_url, [self.editor, self.admin], form_fields=("omnibox",))
+        self.assertCreateFetch(create_url, [self.editor, self.admin], form_fields=("contact_search",))
 
         # initialize form based on a contact
         response = self.client.get(f"{create_url}?c={self.joe.uuid}")
-        omnibox = response.context["form"]["omnibox"]
+        contact_search = response.context["form"]["contact_search"]
+
         self.assertEqual(
-            [{"id": str(self.joe.uuid), "name": "Joe Blow", "type": "contact", "urn": "(202) 555-0149"}],
-            omnibox.value(),
+            {
+                "recipients": [
+                    {
+                        "id": self.joe.uuid,
+                        "name": "Joe Blow",
+                        "urn": "+1 202-555-0149",
+                        "type": "contact",
+                    }
+                ],
+                "advanced": False,
+                "query": None,
+                "exclusions": {},
+            },
+            json.loads(contact_search.value()),
         )
 
         # missing text
         response = self.process_wizard(
             "create",
             create_url,
-            get_broadcast_form_data(self.org, translations={"und": {"text": ""}}, contacts=[self.joe]),
+            self._form_data(translations={"und": {"text": ""}}, contacts=[self.joe]),
         )
         self.assertFormError(response.context["form"], "compose", ["This field is required."])
 
@@ -2046,7 +2095,7 @@ class BroadcastCRUDLTest(TembaTest, CRUDLTestMixin):
         response = self.process_wizard(
             "create",
             create_url,
-            get_broadcast_form_data(self.org, translations=self.create_translations("." * 641), contacts=[self.joe]),
+            self._form_data(translations={"eng": {"text": "." * 641}}, contacts=[self.joe]),
         )
         self.assertFormError(response.context["form"], "compose", ["Maximum allowed text is 640 characters."])
 
@@ -2055,23 +2104,34 @@ class BroadcastCRUDLTest(TembaTest, CRUDLTestMixin):
         response = self.process_wizard(
             "create",
             create_url,
-            get_broadcast_form_data(
-                self.org, translations=self.create_translations(text, attachments * 11), contacts=[self.joe]
-            ),
+            self._form_data(translations={"eng": {"text": text, "attachments": attachments * 11}}, contacts=[self.joe]),
         )
         self.assertFormError(response.context["form"], "compose", ["Maximum allowed attachments is 10 files."])
 
         # empty recipients
+        response = self.process_wizard("create", create_url, self._form_data(translations={"eng": {"text": text}}))
+        self.assertFormError(response.context["form"], "contact_search", ["Contacts or groups are required."])
+
+        # empty query
         response = self.process_wizard(
-            "create", create_url, get_broadcast_form_data(self.org, translations=self.create_translations(text))
+            "create", create_url, self._form_data(advanced=True, translations={"eng": {"text": text}})
         )
-        self.assertFormError(response.context["form"], "omnibox", ["At least one recipient is required."])
+        self.assertFormError(response.context["form"], "contact_search", ["A contact query is required."])
+
+        # invalid query
+        mr_mocks.exception(mailroom.QueryValidationException("Invalid query.", "syntax"))
+        response = self.process_wizard(
+            "create",
+            create_url,
+            self._form_data(advanced=True, translations={"eng": {"text": text}}, query="invalid"),
+        )
+        self.assertFormError(response.context["form"], "contact_search", ["Invalid query syntax."])
 
         # missing start time
         response = self.process_wizard(
             "create",
             create_url,
-            get_broadcast_form_data(self.org, translations=self.create_translations(text), contacts=[self.joe]),
+            self._form_data(translations={"eng": {"text": text}}, contacts=[self.joe]),
         )
         self.assertFormError(response.context["form"], None, ["Select when you would like the broadcast to be sent"])
 
@@ -2079,9 +2139,8 @@ class BroadcastCRUDLTest(TembaTest, CRUDLTestMixin):
         response = self.process_wizard(
             "create",
             create_url,
-            get_broadcast_form_data(
-                self.org,
-                translations=self.create_translations(text),
+            self._form_data(
+                translations={"eng": {"text": text}},
                 contacts=[self.joe],
                 start_datetime="2021-06-24 12:00Z",
                 repeat_period="O",
@@ -2098,11 +2157,13 @@ class BroadcastCRUDLTest(TembaTest, CRUDLTestMixin):
         response = self.process_wizard(
             "create",
             create_url,
-            get_broadcast_form_data(
-                self.org,
-                translations=self.create_translations(text, optin=optin),
+            self._form_data(
+                template=template,
+                variables=["image/jpeg:http://domain/meow.jpg", "World"],
+                translations={"eng": {"text": text}},
                 contacts=[self.joe],
-                start_datetime="2021-06-24 12:00",
+                optin=optin,
+                start_datetime="2021-06-24 12:00Z",
                 repeat_period="W",
                 repeat_days_of_week=["M", "F"],
             ),
@@ -2113,14 +2174,14 @@ class BroadcastCRUDLTest(TembaTest, CRUDLTestMixin):
         broadcast = Broadcast.objects.filter(translations__icontains=text).first()
         self.assertEqual("W", broadcast.schedule.repeat_period)
         self.assertEqual(optin, broadcast.optin)
+        self.assertEqual(template, broadcast.template)
 
         # send a broadcast right away
         response = self.process_wizard(
             "create",
             create_url,
-            get_broadcast_form_data(
-                self.org,
-                translations=self.create_translations(text),
+            self._form_data(
+                translations={"eng": {"text": text}},
                 contacts=[self.joe],
                 send_when=ScheduleForm.SEND_NOW,
             ),
@@ -2132,50 +2193,110 @@ class BroadcastCRUDLTest(TembaTest, CRUDLTestMixin):
 
     def test_update(self):
         optin = self.create_optin("Daily Polls")
-        updated_text = self.create_translations("Updated broadcast", optin=optin)
+        language = self.org.flow_languages[0]
+        updated_text = {language: {"text": "Updated broadcast"}}
 
         broadcast = self.create_broadcast(
             self.admin,
-            "Please update this broadcast when you get a chance.",
+            {language: {"text": "Please update this broadcast when you get a chance."}},
             groups=[self.joe_and_frank],
             contacts=[self.joe],
             schedule=Schedule.create(self.org, timezone.now(), Schedule.REPEAT_DAILY),
         )
+
+        template = self.create_template(
+            "Hello World",
+            [
+                TemplateTranslation(
+                    channel=self.channel,
+                    locale="eng-US",
+                    status=TemplateTranslation.STATUS_APPROVED,
+                    external_id="1003",
+                    external_locale="en_US",
+                    namespace="",
+                    components=[
+                        {"name": "header", "type": "header/media", "variables": {"1": 0}},
+                        {
+                            "name": "body",
+                            "type": "body/text",
+                            "content": "Hello {{1}}",
+                            "variables": {"1": 1},
+                        },
+                    ],
+                    variables=[{"type": "image"}, {"type": "text"}],
+                )
+            ],
+        )
+
         update_url = reverse("msgs.broadcast_update", args=[broadcast.id])
 
         self.assertRequestDisallowed(update_url, [None, self.user, self.agent, self.admin2])
-        self.assertUpdateFetch(update_url, [self.editor, self.admin], form_fields=("omnibox",))
+        self.assertUpdateFetch(update_url, [self.editor, self.admin], form_fields=("contact_search",))
         self.login(self.admin)
 
         response = self.process_wizard(
             "update",
             update_url,
-            get_broadcast_form_data(
-                self.org,
+            self._form_data(
                 translations=updated_text,
+                template=template,
+                variables=["", "World"],
                 contacts=[self.joe],
                 start_datetime="2021-06-24 12:00",
                 repeat_period="W",
                 repeat_days_of_week=["M", "F"],
             ),
         )
+
+        # requires an attachment
+        self.assertFormError(
+            response.context["form"], "compose", ["The attachment for the WhatsApp template is required."]
+        )
+
+        # now with the attachment
+        response = self.process_wizard(
+            "update",
+            update_url,
+            self._form_data(
+                translations=updated_text,
+                template=template,
+                variables=["image/jpeg:http://domain/meow.jpg", "World"],
+                contacts=[self.joe],
+                start_datetime="2021-06-24 12:00",
+                repeat_period="W",
+                repeat_days_of_week=["M", "F"],
+            ),
+        )
+
         self.assertEqual(302, response.status_code)
 
+        # now lets remove the template
+        response = self.process_wizard(
+            "update",
+            update_url,
+            self._form_data(
+                translations={language: {"text": "Updated broadcast"}},
+                contacts=[self.joe],
+                optin=optin,
+                start_datetime="2021-06-24 12:00",
+                repeat_period="W",
+                repeat_days_of_week=["M", "F"],
+            ),
+        )
+
         broadcast.refresh_from_db()
+        # Update should have cleared our template
+        self.assertIsNone(broadcast.template)
 
-        # our optin won't be present in the translation
-        del updated_text["und"]["optin"]
-        self.assertEqual(updated_text["und"], broadcast.get_translation(self.joe))
-
-        # but should be on the broadcast itself
+        # optin should be extracted from the translations form data and saved on the broadcast itself
+        self.assertEqual({language: {"text": "Updated broadcast", "attachments": []}}, broadcast.translations)
         self.assertEqual(optin, broadcast.optin)
 
         # now lets unset the optin from the broadcast
         response = self.process_wizard(
             "update",
             update_url,
-            get_broadcast_form_data(
-                self.org,
+            self._form_data(
                 translations=updated_text,
                 contacts=[self.joe],
                 start_datetime="2021-06-24 12:00",
@@ -2187,29 +2308,26 @@ class BroadcastCRUDLTest(TembaTest, CRUDLTestMixin):
         broadcast.refresh_from_db()
 
         # optin should be gone now
-        self.assertEqual(None, broadcast.optin)
+        self.assertIsNone(broadcast.optin)
 
-        # now update the scheduled broadcast to send now
+        # post the first two forms
         response = self.process_wizard(
             "update",
             update_url,
-            get_broadcast_form_data(
-                self.org, translations=updated_text, contacts=[self.joe], send_when=ScheduleForm.SEND_NOW
+            self._form_data(
+                translations=updated_text,
+                contacts=[self.joe],
             ),
         )
 
-        # when a scheduled broadcast is updated to send now, it'll redirect to broadcast list
-        self.assertRedirect(response, reverse("msgs.broadcast_list"))
-        broadcast.refresh_from_db()
-
-        # shouldn't have a schedule now
-        self.assertEqual(None, broadcast.schedule)
+        # Update broadcast should not have the option to send now
+        self.assertNotContains(response, "Send Now")
 
     def test_localization(self):
         # create a broadcast without a language
         broadcast = self.create_broadcast(
             self.admin,
-            "This should end up as the language und",
+            {"und": {"text": "This should end up as the language und"}},
             groups=[self.joe_and_frank],
             contacts=[self.joe],
             schedule=Schedule.create(self.org, timezone.now(), Schedule.REPEAT_DAILY),
@@ -2227,7 +2345,7 @@ class BroadcastCRUDLTest(TembaTest, CRUDLTestMixin):
         response = self.process_wizard(
             "update",
             update_url,
-            get_broadcast_form_data(self.org, contacts=[self.joe]),
+            self._form_data(translations={}, contacts=[self.joe]),
         )
 
         # we only have a base language and don't have values for org languages, it should be first
@@ -2238,8 +2356,7 @@ class BroadcastCRUDLTest(TembaTest, CRUDLTestMixin):
         response = self.process_wizard(
             "update",
             update_url,
-            get_broadcast_form_data(
-                self.org,
+            self._form_data(
                 translations={"und": {"text": "undefined"}, "eng": {"text": "hello"}, "esp": {"text": "hola"}},
                 contacts=[self.joe],
                 start_datetime="2021-06-24 12:00",
@@ -2252,7 +2369,7 @@ class BroadcastCRUDLTest(TembaTest, CRUDLTestMixin):
         response = self.process_wizard(
             "update",
             update_url,
-            get_broadcast_form_data(self.org, contacts=[self.joe]),
+            self._form_data(translations={}, contacts=[self.joe]),
         )
 
         # We have a primary language, it should be first
@@ -2270,7 +2387,7 @@ class BroadcastCRUDLTest(TembaTest, CRUDLTestMixin):
         response = self.process_wizard(
             "update",
             update_url,
-            get_broadcast_form_data(self.org, contacts=[self.joe]),
+            self._form_data(translations={}, contacts=[self.joe]),
         )
         languages = get_languages(response)
         self.assertEqual("esp", languages[0]["iso"])
@@ -2347,8 +2464,8 @@ class BroadcastCRUDLTest(TembaTest, CRUDLTestMixin):
             'To get started you need to <a href="/channels/channel/claim/">add a channel</a> to your workspace which will allow you to send messages to your contacts.',
         )
 
-    @patch("temba.mailroom.queue_broadcast")
-    def test_to_node(self, mock_queue_broadcast):
+    @mock_mailroom
+    def test_to_node(self, mr_mocks):
         to_node_url = reverse("msgs.broadcast_to_node")
 
         # give Joe a flow run that has stopped on a node
@@ -2377,21 +2494,15 @@ class BroadcastCRUDLTest(TembaTest, CRUDLTestMixin):
             self.admin,
             {"text": "Hurry up"},
             new_obj_query=Broadcast.objects.filter(
-                translations={"und": {"text": "Hurry up"}}, groups=None, contacts=self.joe
+                translations={"und": {"text": "Hurry up"}},
+                base_language="und",
+                groups=None,
+                contacts=None,
+                node_uuid=color_split["uuid"],
             ),
             success_status=200,
         )
-        self.assertEqual("hide", response["Temba-Success"])
 
-        broadcast = Broadcast.objects.get()
-
-        mock_queue_broadcast.assert_called_once_with(broadcast)
-
-        # if there are no contacts at the given node, we don't actually create a broadcast
-        response = self.client.post(
-            f"{to_node_url}?node=4ba8fcfa-f213-4164-a8d4-daede0a02144&count=1", {"text": "Hurry up"}
-        )
-        self.assertEqual("hide", response["Temba-Success"])
         self.assertEqual(1, Broadcast.objects.count())
 
         # if org has no send channel, show blocker
@@ -2406,11 +2517,11 @@ class BroadcastCRUDLTest(TembaTest, CRUDLTestMixin):
         self.assertRequestDisallowed(list_url, [None, self.agent])
         self.assertListFetch(list_url, [self.user, self.editor, self.admin], context_objects=[])
         self.assertContentMenu(list_url, self.user, [])
-        self.assertContentMenu(list_url, self.admin, ["New Broadcast"])
+        self.assertContentMenu(list_url, self.admin, ["Send"])
 
         broadcast = self.create_broadcast(
             self.admin,
-            "Broadcast sent to one contact",
+            {"eng": {"text": "Broadcast sent to one contact"}},
             contacts=[self.joe],
         )
 
@@ -2422,25 +2533,25 @@ class BroadcastCRUDLTest(TembaTest, CRUDLTestMixin):
         self.assertRequestDisallowed(scheduled_url, [None, self.agent])
         self.assertListFetch(scheduled_url, [self.user, self.editor, self.admin], context_objects=[])
         self.assertContentMenu(scheduled_url, self.user, [])
-        self.assertContentMenu(scheduled_url, self.admin, ["New Broadcast"])
+        self.assertContentMenu(scheduled_url, self.admin, ["Send"])
 
         bc1 = self.create_broadcast(
             self.admin,
-            "good morning",
+            {"eng": {"text": "good morning"}},
             contacts=[self.joe],
             schedule=Schedule.create(self.org, timezone.now(), Schedule.REPEAT_DAILY),
         )
         bc2 = self.create_broadcast(
             self.admin,
-            "good evening",
+            {"eng": {"text": "good evening"}},
             contacts=[self.frank],
             schedule=Schedule.create(self.org, timezone.now(), Schedule.REPEAT_DAILY),
         )
-        self.create_broadcast(self.admin, "not_scheduled", groups=[self.joe_and_frank])
+        self.create_broadcast(self.admin, {"eng": {"text": "not_scheduled"}}, groups=[self.joe_and_frank])
 
         bc3 = self.create_broadcast(
             self.admin,
-            "good afternoon",
+            {"eng": {"text": "good afternoon"}},
             contacts=[self.frank],
             schedule=Schedule.create(self.org, timezone.now(), Schedule.REPEAT_DAILY),
         )
@@ -2456,7 +2567,7 @@ class BroadcastCRUDLTest(TembaTest, CRUDLTestMixin):
         schedule = Schedule.create(self.org, timezone.now(), "D", repeat_days_of_week="MWF")
         broadcast = self.create_broadcast(
             self.admin,
-            "Daily reminder",
+            {"eng": {"text": "Daily reminder"}},
             groups=[self.joe_and_frank],
             schedule=schedule,
         )
@@ -2484,8 +2595,7 @@ class BroadcastCRUDLTest(TembaTest, CRUDLTestMixin):
             attachments = compose_deserialize_attachments([attachment])
 
             sends.append(
-                Broadcast.create(
-                    self.org,
+                self.create_broadcast(
                     self.admin,
                     translations={"eng": {"text": text, "attachments": attachments}},
                     groups=[self.joe_and_frank],
@@ -2508,7 +2618,7 @@ class BroadcastCRUDLTest(TembaTest, CRUDLTestMixin):
         schedule = Schedule.create(self.org, timezone.now(), "D", repeat_days_of_week="MWF")
         broadcast = self.create_broadcast(
             self.admin,
-            "Daily reminder",
+            {"eng": {"text": "Daily reminder"}},
             groups=[self.joe_and_frank],
             schedule=schedule,
         )
@@ -2803,11 +2913,10 @@ class SystemLabelTest(TembaTest):
         self.create_incoming_msg(contact1, "Message 2")
         msg3 = self.create_incoming_msg(contact1, "Message 3")
         msg4 = self.create_incoming_msg(contact1, "Message 4")
-        Broadcast.create(self.org, self.user, {"eng": "Broadcast 2"}, contacts=[contact1, contact2])
-        Broadcast.create(
-            self.org,
+        self.create_broadcast(self.user, {"eng": {"text": "Broadcast 2"}}, contacts=[contact1, contact2], status="Q")
+        self.create_broadcast(
             self.user,
-            {"eng": "Broadcast 2"},
+            {"eng": {"text": "Broadcast 2"}},
             contacts=[contact1, contact2],
             schedule=Schedule.create(self.org, timezone.now(), Schedule.REPEAT_DAILY),
         )
@@ -2833,16 +2942,15 @@ class SystemLabelTest(TembaTest):
 
         bcast1 = self.create_broadcast(
             self.user,
-            "Broadcast 1",
+            {"eng": {"text": "Broadcast 1"}},
             contacts=[contact1, contact2],
             msg_status=Msg.STATUS_INITIALIZING,
         )
         msg5, msg6 = tuple(Msg.objects.filter(broadcast=bcast1))
 
-        Broadcast.create(
-            self.org,
+        self.create_broadcast(
             self.user,
-            {"eng": "Broadcast 3"},
+            {"eng": {"text": "Broadcast 3"}},
             contacts=[contact1],
             schedule=Schedule.create(self.org, timezone.now(), Schedule.REPEAT_DAILY),
         )
@@ -3046,3 +3154,31 @@ class MediaCRUDLTest(CRUDLTestMixin, TembaTest):
         self.assertEqual([media2, media1], list(response.context["object_list"]))
 
         self.clear_storage()
+
+
+class TrimOldBroadcastsToNodesTest(MigrationTest):
+    app = "msgs"
+    migrate_from = "0267_broadcast_node_uuid"
+    migrate_to = "0268_trim_old_broadcasts_to_nodes"
+
+    def setUpBeforeMigration(self, apps):
+        def create_broadcast(status: str, num_contacts: int):
+            contacts = [self.create_contact(f"Contact {i}", urns=[]) for i in range(num_contacts)]
+            bcast = Broadcast.objects.create(
+                org=self.org,
+                translations={"und": {"text": "Hi"}},
+                base_language="und",
+                status=status,
+                created_by=self.admin,
+            )
+            bcast.contacts.add(*contacts)
+            return bcast
+
+        self.bcast1 = create_broadcast("P", 55)  # should be ignored because of status
+        self.bcast2 = create_broadcast("S", 45)  # should be ignored because of contact count
+        self.bcast3 = create_broadcast("S", 2005)  # requires 2 batches of deletes
+
+    def test_migration(self):
+        self.assertEqual(55, self.bcast1.contacts.count())
+        self.assertEqual(45, self.bcast2.contacts.count())
+        self.assertEqual(50, self.bcast3.contacts.count())  # trimmed

@@ -537,7 +537,7 @@ class EndpointsTest(APITest):
         self.assertEqual(response.status_code, 429)
 
         # if user loses access to the token's role, don't allow the request
-        self.org.add_user(self.admin, OrgRole.SURVEYOR)
+        self.org.add_user(self.admin, OrgRole.EDITOR)
 
         self.assertEqual(request_by_token(campaigns_url, token1.key).status_code, 403)
         self.assertEqual(request_by_basic_auth(campaigns_url, self.admin.username, token1.key).status_code, 403)
@@ -562,6 +562,10 @@ class EndpointsTest(APITest):
         response = self.client.get(root_url)
         self.assertContains(response, "We provide a RESTful JSON API")
 
+        # POSTing just returns the docs with a 405
+        response = self.client.post(root_url, {})
+        self.assertContains(response, "We provide a RESTful JSON API", status_code=405)
+
         # same thing if user navigates to just /api
         response = self.client.get(reverse("api"), follow=True)
         self.assertContains(response, "We provide a RESTful JSON API")
@@ -571,6 +575,22 @@ class EndpointsTest(APITest):
         self.assertEqual(200, response.status_code)
         self.assertIsInstance(response.json(), dict)
         self.assertEqual(response.json()["runs"], "http://testserver/api/v2/runs")  # endpoints are listed
+
+    def test_docs(self):
+        messages_url = reverse("api.v2.messages")
+
+        # test fetching docs anonymously
+        response = self.client.get(messages_url)
+        self.assertContains(response, "This endpoint allows you to list messages in your account.")
+
+        # you can also post to docs endpoints tho it just returns the docs with a 403
+        response = self.client.post(messages_url, {})
+        self.assertContains(response, "This endpoint allows you to list messages in your account.", status_code=403)
+
+        # test fetching docs logged in
+        self.login(self.editor)
+        response = self.client.get(messages_url)
+        self.assertContains(response, "This endpoint allows you to list messages in your account.")
 
     def test_explorer(self):
         explorer_url = reverse("api.v2.explorer")
@@ -797,20 +817,10 @@ class EndpointsTest(APITest):
         response = self.client.get(endpoint_url)
         self.assertEqual(403, response.status_code)
 
-        # test fetching docs anonymously
-        self.client.logout()
-        response = self.client.get(reverse("api.v2.archives"))
-        self.assertContains(response, "This endpoint allows you to list")
-
-        # and logged in
-        self.login(self.editor)
-        response = self.client.get(reverse("api.v2.archives"))
-        self.assertContains(response, "This endpoint allows you to list")
-
     def test_boundaries(self):
         endpoint_url = reverse("api.v2.boundaries") + ".json"
 
-        self.assertGetNotPermitted(endpoint_url, [None, self.agent])
+        self.assertGetNotPermitted(endpoint_url, [None])
         self.assertPostNotAllowed(endpoint_url)
         self.assertDeleteNotAllowed(endpoint_url)
 
@@ -940,8 +950,8 @@ class EndpointsTest(APITest):
 
         self.assertGet(endpoint_url, [self.admin], results=[])
 
-    @patch("temba.mailroom.queue_broadcast")
-    def test_broadcasts(self, mock_queue_broadcast):
+    @mock_mailroom
+    def test_broadcasts(self, mr_mocks):
         endpoint_url = reverse("api.v2.broadcasts") + ".json"
 
         self.assertGetNotPermitted(endpoint_url, [None, self.agent])
@@ -950,28 +960,24 @@ class EndpointsTest(APITest):
 
         reporters = self.create_group("Reporters", [self.joe, self.frank])
 
-        bcast1 = Broadcast.create(self.org, self.admin, {"eng": {"text": "Hello 1"}}, urns=["twitter:franky"])
-        bcast2 = Broadcast.create(self.org, self.admin, {"eng": {"text": "Hello 2"}}, contacts=[self.joe])
-        bcast3 = Broadcast.create(self.org, self.admin, {"eng": {"text": "Hello 3"}}, contacts=[self.frank], status="S")
-        bcast4 = Broadcast.create(
-            self.org,
+        bcast1 = self.create_broadcast(self.admin, {"eng": {"text": "Hello 1"}}, urns=["twitter:franky"], status="Q")
+        bcast2 = self.create_broadcast(self.admin, {"eng": {"text": "Hello 2"}}, contacts=[self.joe], status="Q")
+        bcast3 = self.create_broadcast(self.admin, {"eng": {"text": "Hello 3"}}, contacts=[self.frank], status="S")
+        bcast4 = self.create_broadcast(
             self.admin,
             {"eng": {"text": "Hello 4"}},
             urns=["twitter:franky"],
             contacts=[self.joe],
             groups=[reporters],
+            status="F",
         )
-        Broadcast.create(
-            self.org,
+        self.create_broadcast(
             self.admin,
             {"eng": {"text": "Scheduled"}},
             contacts=[self.joe],
             schedule=Schedule.create(self.org, timezone.now(), Schedule.REPEAT_DAILY),
         )
-        Broadcast.create(self.org2, self.admin2, {"eng": {"text": "Different org..."}}, contacts=[self.hans])
-
-        bcast4.status = "F"
-        bcast4.save(update_fields=("status",))
+        self.create_broadcast(self.admin2, {"eng": {"text": "Different org..."}}, contacts=[self.hans], org=self.org2)
 
         # no filtering
         response = self.assertGet(
@@ -1107,8 +1113,6 @@ class EndpointsTest(APITest):
         self.assertEqual(["twitter:franky"], broadcast.urns)
         self.assertEqual({self.joe, self.frank}, set(broadcast.contacts.all()))
         self.assertEqual({reporters}, set(broadcast.groups.all()))
-
-        mock_queue_broadcast.assert_called_once_with(broadcast)
 
         # create new broadcast without translations
         response = self.assertPost(
@@ -1836,7 +1840,7 @@ class EndpointsTest(APITest):
             endpoint_url,
             [self.user, self.editor, self.admin, self.agent],
             results=[contact4, self.joe, contact2, contact1, self.frank],
-            num_queries=NUM_BASE_SESSION_QUERIES + 6,
+            num_queries=NUM_BASE_SESSION_QUERIES + 7,
         )
         self.assertEqual(
             {
@@ -1846,6 +1850,7 @@ class EndpointsTest(APITest):
                 "language": "fra",
                 "urns": ["tel:+250788000004"],
                 "groups": [{"uuid": group.uuid, "name": group.name}],
+                "notes": [],
                 "fields": {"nickname": "Donnie", "gender": "male"},
                 "flow": {"uuid": str(survey.uuid), "name": "Survey"},
                 "created_on": format_datetime(contact4.created_on),
@@ -1863,7 +1868,7 @@ class EndpointsTest(APITest):
             [self.admin],
             results=[contact4, self.joe, contact2, contact1, self.frank],
             by_token=True,
-            num_queries=NUM_BASE_TOKEN_QUERIES + 6,
+            num_queries=NUM_BASE_TOKEN_QUERIES + 7,
         )
 
         # with expanded URNs
@@ -1887,6 +1892,7 @@ class EndpointsTest(APITest):
                     }
                 ],
                 "groups": [{"uuid": group.uuid, "name": group.name}],
+                "notes": [],
                 "fields": {"nickname": "Donnie", "gender": "male"},
                 "flow": {"uuid": str(survey.uuid), "name": "Survey"},
                 "created_on": format_datetime(contact4.created_on),
@@ -1910,7 +1916,7 @@ class EndpointsTest(APITest):
                 endpoint_url,
                 [self.user, self.editor, self.admin, self.agent],
                 results=[contact4, self.joe, contact2, contact1, self.frank],
-                num_queries=NUM_BASE_SESSION_QUERIES + 6,
+                num_queries=NUM_BASE_SESSION_QUERIES + 7,
             )
             self.assertEqual(
                 {
@@ -1921,6 +1927,7 @@ class EndpointsTest(APITest):
                     "language": "fra",
                     "urns": ["tel:********"],
                     "groups": [{"uuid": group.uuid, "name": group.name}],
+                    "notes": [],
                     "fields": {"nickname": "Donnie", "gender": "male"},
                     "flow": {"uuid": str(survey.uuid), "name": "Survey"},
                     "created_on": format_datetime(contact4.created_on),
@@ -1954,6 +1961,7 @@ class EndpointsTest(APITest):
                         }
                     ],
                     "groups": [{"uuid": group.uuid, "name": group.name}],
+                    "notes": [],
                     "fields": {"nickname": "Donnie", "gender": "male"},
                     "flow": {"uuid": str(survey.uuid), "name": "Survey"},
                     "created_on": format_datetime(contact4.created_on),
@@ -2005,6 +2013,7 @@ class EndpointsTest(APITest):
                     "language": None,
                     "urns": [],
                     "groups": [],
+                    "notes": [],
                     "fields": {},
                     "flow": None,
                     "created_on": format_datetime(contact3.created_on),
@@ -2033,6 +2042,7 @@ class EndpointsTest(APITest):
                 "language": None,
                 "urns": [],
                 "groups": [],
+                "notes": [],
                 "fields": {"nickname": None, "gender": None},
                 "flow": None,
                 "created_on": format_datetime(empty.created_on),
@@ -2326,6 +2336,40 @@ class EndpointsTest(APITest):
         # try to delete a contact in another org
         self.assertDelete(endpoint_url + f"?uuid={hans.uuid}", self.editor, status=404)
 
+        # add some notes for frank
+        frank_url = endpoint_url + f"?uuid={self.frank.uuid}"
+        for i in range(1, 6):
+            self.assertPost(
+                frank_url,
+                self.admin,
+                {"note": f"Frank is a good guy ({i})"},
+            )
+
+        # four more notes by another user to make sure prefetch works
+        for i in range(6, 10):
+            self.assertPost(
+                frank_url,
+                self.editor,
+                {"note": f"Frank is an okay guy ({i})"},
+            )
+
+        self.frank.refresh_from_db()
+        response = self.assertGet(
+            frank_url, [self.editor], results=[self.frank], num_queries=NUM_BASE_SESSION_QUERIES + 7
+        )
+
+        # our oldest note should be number 5
+        self.assertEqual(
+            "Frank is a good guy (5)",
+            response.json()["results"][0]["notes"][0]["text"],
+        )
+
+        # our newest note should be number 6
+        self.assertEqual(
+            "Frank is an okay guy (9)",
+            response.json()["results"][0]["notes"][-1]["text"],
+        )
+
     @mock_mailroom
     def test_contacts_as_agent(self, mr_mocks):
         endpoint_url = reverse("api.v2.contacts") + ".json"
@@ -2350,6 +2394,7 @@ class EndpointsTest(APITest):
                     "language": None,
                     "urns": ["telegram:12345"],
                     "groups": [],
+                    "notes": [],
                     "fields": {"age": "40", "height": "180"},
                     "flow": None,
                     "created_on": format_datetime(contact.created_on),
@@ -4019,7 +4064,9 @@ class EndpointsTest(APITest):
         )
 
         # filter by broadcast
-        broadcast = self.create_broadcast(self.user, "A beautiful broadcast", contacts=[self.joe, self.frank])
+        broadcast = self.create_broadcast(
+            self.user, {"eng": {"text": "A beautiful broadcast"}}, contacts=[self.joe, self.frank]
+        )
         self.assertGet(
             endpoint_url + f"?broadcast={broadcast.id}",
             [self.editor],
@@ -4092,7 +4139,7 @@ class EndpointsTest(APITest):
         )
 
         self.assertEqual(
-            call(self.org.id, self.admin.id, self.joe.id, "Interesting", [], None),
+            call(self.org, self.admin, self.joe, "Interesting", [], None),
             mr_mocks.calls["msg_send"][-1],
         )
 
@@ -4119,7 +4166,7 @@ class EndpointsTest(APITest):
             endpoint_url, self.admin, {"contact": self.joe.uuid, "attachments": [str(upload.uuid)]}, status=201
         )
         self.assertEqual(  # check that was sent via mailroom
-            call(self.org.id, self.admin.id, self.joe.id, "", [f"image/jpeg:{upload.url}"], None),
+            call(self.org, self.admin, self.joe, "", [f"image/jpeg:{upload.url}"], None),
             mr_mocks.calls["msg_send"][-1],
         )
 
@@ -4131,7 +4178,7 @@ class EndpointsTest(APITest):
             status=201,
         )
         self.assertEqual(
-            call(self.org.id, self.admin.id, self.joe.id, "", [f"image/jpeg:{upload.url}"], None),
+            call(self.org, self.admin, self.joe, "", [f"image/jpeg:{upload.url}"], None),
             mr_mocks.calls["msg_send"][-1],
         )
 
@@ -4823,9 +4870,8 @@ class EndpointsTest(APITest):
             num_queries=NUM_BASE_SESSION_QUERIES + 1,
         )
 
-    @patch("temba.mailroom.client.MailroomClient.ticket_close")
-    @patch("temba.mailroom.client.MailroomClient.ticket_reopen")
-    def test_tickets(self, mock_ticket_reopen, mock_ticket_close):
+    @mock_mailroom
+    def test_tickets(self, mr_mocks):
         endpoint_url = reverse("api.v2.tickets") + ".json"
 
         self.assertGetNotPermitted(endpoint_url, [None])
@@ -4838,13 +4884,13 @@ class EndpointsTest(APITest):
         flow = self.create_flow("Support")
 
         ticket1 = self.create_ticket(
-            ann, "Help", opened_by=self.admin, closed_on=datetime(2021, 1, 1, 12, 30, 45, 123456, tzone.utc)
+            ann, opened_by=self.admin, closed_on=datetime(2021, 1, 1, 12, 30, 45, 123456, tzone.utc)
         )
-        ticket2 = self.create_ticket(bob, "Really", opened_in=flow)
-        ticket3 = self.create_ticket(bob, "Pleeeease help", assignee=self.agent)
+        ticket2 = self.create_ticket(bob, opened_in=flow)
+        ticket3 = self.create_ticket(bob, assignee=self.agent)
 
         # on another org
-        self.create_ticket(self.create_contact("Jim", urns=["twitter:jimmy"], org=self.org2), "Stuff")
+        self.create_ticket(self.create_contact("Jim", urns=["twitter:jimmy"], org=self.org2))
 
         # no filtering
         self.assertGet(
@@ -4857,7 +4903,7 @@ class EndpointsTest(APITest):
                     "contact": {"uuid": str(bob.uuid), "name": "Bob"},
                     "status": "open",
                     "topic": {"uuid": str(self.org.default_ticket_topic.uuid), "name": "General"},
-                    "body": "Pleeeease help",
+                    "body": None,
                     "opened_on": format_datetime(ticket3.opened_on),
                     "opened_by": None,
                     "opened_in": None,
@@ -4870,7 +4916,7 @@ class EndpointsTest(APITest):
                     "contact": {"uuid": str(bob.uuid), "name": "Bob"},
                     "status": "open",
                     "topic": {"uuid": str(self.org.default_ticket_topic.uuid), "name": "General"},
-                    "body": "Really",
+                    "body": None,
                     "opened_on": format_datetime(ticket2.opened_on),
                     "opened_by": None,
                     "opened_in": {"uuid": str(flow.uuid), "name": "Support"},
@@ -4883,7 +4929,7 @@ class EndpointsTest(APITest):
                     "contact": {"uuid": str(ann.uuid), "name": "Ann"},
                     "status": "closed",
                     "topic": {"uuid": str(self.org.default_ticket_topic.uuid), "name": "General"},
-                    "body": "Help",
+                    "body": None,
                     "opened_on": format_datetime(ticket1.opened_on),
                     "opened_by": {"email": "admin@nyaruka.com", "name": "Andy"},
                     "opened_in": None,
@@ -4913,12 +4959,12 @@ class EndpointsTest(APITest):
 
         # create some tickets
         sales = Topic.create(self.org, self.admin, "Sales")
-        ticket1 = self.create_ticket(self.joe, "Help", closed_on=datetime(2021, 1, 1, 12, 30, 45, 123456, tzone.utc))
-        ticket2 = self.create_ticket(self.joe, "Help")
-        self.create_ticket(self.frank, "Pleeeease help")
+        ticket1 = self.create_ticket(self.joe, closed_on=datetime(2021, 1, 1, 12, 30, 45, 123456, tzone.utc))
+        ticket2 = self.create_ticket(self.joe)
+        self.create_ticket(self.frank)
 
         # on another org
-        ticket4 = self.create_ticket(self.create_contact("Jim", urns=["twitter:jimmy"], org=self.org2), "Hi")
+        ticket4 = self.create_ticket(self.create_contact("Jim", urns=["twitter:jimmy"], org=self.org2))
 
         # try actioning more tickets than this endpoint is allowed to operate on at one time
         self.assertPost(
@@ -5055,7 +5101,7 @@ class EndpointsTest(APITest):
         other_org = Topic.create(self.org2, self.admin, "Bugs")
 
         contact = self.create_contact("Ann", phone="+1234567890")
-        self.create_ticket(contact, "Help", topic=support)
+        self.create_ticket(contact, topic=support)
 
         # no filtering
         self.assertGet(
@@ -5166,22 +5212,10 @@ class EndpointsTest(APITest):
         self.assertPostNotAllowed(endpoint_url)
         self.assertDeleteNotAllowed(endpoint_url)
 
-        self.surveyor.first_name = "Stu"
-        self.surveyor.last_name = "McSurveys"
-        self.surveyor.save()
-
         self.assertGet(
             endpoint_url,
             [self.agent, self.user, self.editor, self.admin],
             results=[
-                {
-                    "avatar": None,
-                    "email": "surveyor@nyaruka.com",
-                    "first_name": "Stu",
-                    "last_name": "McSurveys",
-                    "role": "surveyor",
-                    "created_on": format_datetime(self.surveyor.date_joined),
-                },
                 {
                     "avatar": None,
                     "email": "agent@nyaruka.com",
