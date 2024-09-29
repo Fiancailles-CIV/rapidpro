@@ -40,7 +40,7 @@ from . import fields
 from .serializers import format_datetime, normalize_extra
 
 NUM_BASE_SESSION_QUERIES = 4  # number of queries required for any request using session auth
-NUM_BASE_TOKEN_QUERIES = 3  # number of queries required for any request using token auth
+NUM_BASE_TOKEN_QUERIES = 2  # number of queries required for any request using token auth
 
 
 class APITest(APITestMixin, TembaTest):
@@ -467,9 +467,9 @@ class EndpointsTest(APITest):
         campaigns_url = reverse("api.v2.campaigns")
         fields_url = reverse("api.v2.fields")
 
-        token1 = APIToken.get_or_create(self.org, self.admin, role=OrgRole.ADMINISTRATOR)
-        token2 = APIToken.get_or_create(self.org, self.editor, role=OrgRole.EDITOR)
-        token3 = APIToken.get_or_create(self.org, self.customer_support, role=OrgRole.ADMINISTRATOR)
+        token1 = APIToken.create(self.org, self.admin)
+        token2 = APIToken.create(self.org, self.editor)
+        token3 = APIToken.create(self.org, self.customer_support)
 
         # can request fields endpoint using all 3 methods
         response = request_by_token(fields_url, token1.key)
@@ -536,15 +536,14 @@ class EndpointsTest(APITest):
         response = request_by_token(fields_url, token1.key)
         self.assertEqual(response.status_code, 429)
 
-        # if user loses access to the token's role, don't allow the request
-        self.org.add_user(self.admin, OrgRole.EDITOR)
+        # if user is demoted to a role that can't use tokens, tokens shouldn't work for them
+        self.org.add_user(self.admin, OrgRole.VIEWER)
 
         self.assertEqual(request_by_token(campaigns_url, token1.key).status_code, 403)
         self.assertEqual(request_by_basic_auth(campaigns_url, self.admin.username, token1.key).status_code, 403)
-        self.assertEqual(request_by_token(contacts_url, token2.key).status_code, 200)  # other token unaffected
-        self.assertEqual(request_by_basic_auth(contacts_url, self.editor.username, token2.key).status_code, 200)
 
         # and if user is inactive, disallow the request
+        self.org.add_user(self.admin, OrgRole.ADMINISTRATOR)
         self.admin.is_active = False
         self.admin.save()
 
@@ -609,8 +608,15 @@ class EndpointsTest(APITest):
         self.assertEqual(200, response.status_code)
 
         self.login(self.admin)
+
         response = self.client.get(explorer_url)
-        self.assertEqual(200, response.status_code)
+        self.assertContains(response, "To use the explorer you need to first create")
+        self.assertContains(response, reverse("orgs.user_tokens"))
+
+        APIToken.create(self.org, self.admin)
+
+        response = self.client.get(explorer_url)
+        self.assertContains(response, "All operations work against real data in the <b>Nyaruka</b> workspace.")
 
     def test_pagination(self):
         endpoint_url = reverse("api.v2.runs") + ".json"
@@ -960,16 +966,22 @@ class EndpointsTest(APITest):
 
         reporters = self.create_group("Reporters", [self.joe, self.frank])
 
-        bcast1 = self.create_broadcast(self.admin, {"eng": {"text": "Hello 1"}}, urns=["twitter:franky"], status="Q")
-        bcast2 = self.create_broadcast(self.admin, {"eng": {"text": "Hello 2"}}, contacts=[self.joe], status="Q")
-        bcast3 = self.create_broadcast(self.admin, {"eng": {"text": "Hello 3"}}, contacts=[self.frank], status="S")
+        bcast1 = self.create_broadcast(
+            self.admin, {"eng": {"text": "Hello 1"}}, urns=["twitter:franky"], status=Broadcast.STATUS_PENDING
+        )
+        bcast2 = self.create_broadcast(
+            self.admin, {"eng": {"text": "Hello 2"}}, contacts=[self.joe], status=Broadcast.STATUS_PENDING
+        )
+        bcast3 = self.create_broadcast(
+            self.admin, {"eng": {"text": "Hello 3"}}, contacts=[self.frank], status=Broadcast.STATUS_COMPLETED
+        )
         bcast4 = self.create_broadcast(
             self.admin,
             {"eng": {"text": "Hello 4"}},
             urns=["twitter:franky"],
             contacts=[self.joe],
             groups=[reporters],
-            status="F",
+            status=Broadcast.STATUS_FAILED,
         )
         self.create_broadcast(
             self.admin,
@@ -984,20 +996,21 @@ class EndpointsTest(APITest):
             endpoint_url,
             [self.user, self.editor, self.admin],
             results=[bcast4, bcast3, bcast2, bcast1],
-            num_queries=NUM_BASE_SESSION_QUERIES + 3,
+            num_queries=NUM_BASE_SESSION_QUERIES + 4,
         )
         resp_json = response.json()
 
         self.assertEqual(
             {
                 "id": bcast2.id,
+                "status": "pending",
+                "progress": {"total": -1, "started": 0},
                 "urns": [],
                 "contacts": [{"uuid": self.joe.uuid, "name": self.joe.name}],
                 "groups": [],
                 "text": {"eng": "Hello 2"},
                 "attachments": {"eng": []},
                 "base_language": "eng",
-                "status": "queued",
                 "created_on": format_datetime(bcast2.created_on),
             },
             resp_json["results"][2],
@@ -1005,13 +1018,14 @@ class EndpointsTest(APITest):
         self.assertEqual(
             {
                 "id": bcast4.id,
+                "status": "failed",
+                "progress": {"total": 2, "started": 2},
                 "urns": ["twitter:franky"],
                 "contacts": [{"uuid": self.joe.uuid, "name": self.joe.name}],
                 "groups": [{"uuid": reporters.uuid, "name": reporters.name}],
                 "text": {"eng": "Hello 4"},
                 "attachments": {"eng": []},
                 "base_language": "eng",
-                "status": "failed",
                 "created_on": format_datetime(bcast4.created_on),
             },
             resp_json["results"][0],
@@ -2782,7 +2796,7 @@ class EndpointsTest(APITest):
         self.assertPostNotAllowed(endpoint_url)
         self.assertDeleteNotAllowed(endpoint_url)
 
-        self.import_file("subflow")
+        self.import_file("test_flows/subflow.json")
         flow = Flow.objects.get(name="Parent Flow")
 
         # all flow dependencies and we should get the child flow
@@ -2800,7 +2814,7 @@ class EndpointsTest(APITest):
         )
 
         # import the clinic app which has campaigns
-        self.import_file("the_clinic")
+        self.import_file("test_flows/the_clinic.json")
 
         # our catchall flow, all alone
         flow = Flow.objects.get(name="Catch All")
@@ -2868,7 +2882,7 @@ class EndpointsTest(APITest):
         )
 
         # test that flows are migrated
-        self.import_file("favorites_v13")
+        self.import_file("test_flows/favorites_v13.json")
 
         flow = Flow.objects.get(name="Favorites")
         self.assertGet(
@@ -3178,7 +3192,7 @@ class EndpointsTest(APITest):
         self.assertPostNotPermitted(endpoint_url, [None, self.agent, self.user])
         self.assertDeleteNotAllowed(endpoint_url)
 
-        flow = self.get_flow("favorites_v13")
+        flow = self.create_flow("Test")
 
         # try to create an empty flow start
         self.assertPost(endpoint_url, self.editor, {}, errors={"flow": "This field is required."})
@@ -3389,23 +3403,25 @@ class EndpointsTest(APITest):
             endpoint_url,
             [self.user, self.editor],
             results=[start4, start3, start2, start1],
-            num_queries=NUM_BASE_SESSION_QUERIES + 4,
+            num_queries=NUM_BASE_SESSION_QUERIES + 5,
         )
         self.assertEqual(
             response.json()["results"][1],
             {
-                "id": start3.id,
                 "uuid": str(start3.uuid),
-                "flow": {"uuid": flow.uuid, "name": "Favorites"},
+                "flow": {"uuid": flow.uuid, "name": "Test"},
                 "contacts": [{"uuid": self.joe.uuid, "name": "Joe Blow"}],
                 "groups": [{"uuid": hans_group.uuid, "name": "hans"}],
-                "restart_participants": False,
-                "exclude_active": False,
                 "status": "pending",
-                "extra": {"first_name": "Bob", "last_name": "Marley"},
+                "progress": {"total": -1, "started": 0},
                 "params": {"first_name": "Bob", "last_name": "Marley"},
                 "created_on": format_datetime(start3.created_on),
                 "modified_on": format_datetime(start3.modified_on),
+                # deprecated
+                "id": start3.id,
+                "extra": {"first_name": "Bob", "last_name": "Marley"},
+                "restart_participants": False,
+                "exclude_active": False,
             },
         )
 
@@ -3414,9 +3430,6 @@ class EndpointsTest(APITest):
 
         # check filtering by in invalid UUID
         self.assertGet(endpoint_url + "?uuid=xyz", [self.editor], errors={None: "Value for uuid must be a valid UUID"})
-
-        # check filtering by id (deprecated)
-        response = self.assertGet(endpoint_url + f"?id={start2.id}", [self.editor], results=[start2])
 
         response = self.assertPost(
             endpoint_url,
@@ -3905,7 +3918,7 @@ class EndpointsTest(APITest):
         response = self.client.post(endpoint_url, {}, HTTP_X_FORWARDED_HTTPS="https")
         self.assertResponseError(response, "file", "No file was submitted.")
 
-        response = upload(self.agent, f"{settings.MEDIA_ROOT}/test_imports/simple.xls")
+        response = upload(self.agent, f"{settings.MEDIA_ROOT}/test_imports/simple.xlsx")
         self.assertResponseError(response, "file", "Unsupported file type.")
 
         with patch("temba.msgs.models.Media.MAX_UPLOAD_SIZE", 1024):
@@ -3918,7 +3931,7 @@ class EndpointsTest(APITest):
             {
                 "uuid": "b97f69f7-5edf-45c7-9fda-d37066eae91d",
                 "content_type": "image/jpeg",
-                "url": f"/media/test_orgs/{self.org.id}/media/b97f/b97f69f7-5edf-45c7-9fda-d37066eae91d/steve%20marten.jpg",
+                "url": f"{settings.STORAGE_URL}/orgs/{self.org.id}/media/b97f/b97f69f7-5edf-45c7-9fda-d37066eae91d/steve%20marten.jpg",
                 "filename": "steve marten.jpg",
                 "size": 7461,
             },
@@ -3927,8 +3940,6 @@ class EndpointsTest(APITest):
 
         media = Media.objects.get()
         self.assertEqual(Media.STATUS_READY, media.status)
-
-        self.clear_storage()
 
     @mock_mailroom
     def test_messages(self, mr_mocks):
@@ -4203,8 +4214,6 @@ class EndpointsTest(APITest):
         self.assertIsNone(msg_json["channel"])
         self.assertIsNone(msg_json["urn"])
         self.assertEqual("failed", msg_json["status"])
-
-        self.clear_storage()
 
     def test_message_actions(self):
         endpoint_url = reverse("api.v2.message_actions") + ".json"

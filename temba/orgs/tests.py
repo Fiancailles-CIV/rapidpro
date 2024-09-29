@@ -1,7 +1,7 @@
 import io
 import smtplib
 from datetime import date, datetime, timedelta, timezone as tzone
-from unittest.mock import patch
+from unittest.mock import call, patch
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
@@ -44,7 +44,6 @@ from temba.schedules.models import Schedule
 from temba.templates.models import TemplateTranslation
 from temba.tests import CRUDLTestMixin, TembaTest, matchers, mock_mailroom
 from temba.tests.base import get_contact_search
-from temba.tests.s3 import MockS3Client, jsonlgz_encode
 from temba.tickets.models import TicketExport
 from temba.triggers.models import Trigger
 from temba.utils import json, languages
@@ -197,8 +196,6 @@ class UserTest(TembaTest):
         self.assertFalse(user.is_beta)
         self.assertEqual({"email": "jim@rapidpro.io", "name": "Jim McFlow"}, user.as_engine_ref())
         self.assertEqual([self.org, self.org2], list(user.get_orgs().order_by("id")))
-        self.assertEqual(40, len(user.get_api_token(self.org)))
-        self.assertIsNone(user.get_api_token(self.org2))  # can't generate API token as agent
 
         user.last_name = ""
         user.save(update_fields=("last_name",))
@@ -672,6 +669,8 @@ class UserTest(TembaTest):
         self.assertFalse(self.editor.is_active)
 
     def test_release(self):
+        token = APIToken.create(self.org, self.admin)
+
         # admin doesn't "own" any orgs
         self.assertEqual(0, len(self.admin.get_owned_orgs()))
 
@@ -691,6 +690,9 @@ class UserTest(TembaTest):
         # and we take our org with us
         self.org.refresh_from_db()
         self.assertFalse(self.org.is_active)
+
+        token.refresh_from_db()
+        self.assertFalse(token.is_active)
 
 
 class OrgTest(TembaTest):
@@ -1143,11 +1145,6 @@ class OrgTest(TembaTest):
 
 
 class OrgDeleteTest(TembaTest):
-    def setUp(self):
-        super().setUp()
-
-        self.mock_s3 = MockS3Client()
-
     def create_content(self, org, user) -> list:
         # add child workspaces
         org.features = [Org.FEATURE_CHILD_ORGS]
@@ -1398,28 +1395,15 @@ class OrgDeleteTest(TembaTest):
         ExportFinishedNotificationType.create(tickets)
 
     def _create_archive_content(self, org, add):
-        def create_archive(org, period, rollup=None):
-            file = f"{org.id}/archive{Archive.objects.all().count()}.jsonl.gz"
-            body, md5, size = jsonlgz_encode([{"id": 1}])
-            archive = Archive.objects.create(
-                org=org,
-                url=f"http://temba-archives.aws.com/{file}",
-                start_date=timezone.now(),
-                build_time=100,
-                archive_type=Archive.TYPE_MSG,
-                period=period,
-                rollup=rollup,
-                size=size,
-                hash=md5,
+        daily = add(self.create_archive(Archive.TYPE_MSG, Archive.PERIOD_DAILY, timezone.now(), [{"id": 1}], org=org))
+        add(
+            self.create_archive(
+                Archive.TYPE_MSG, Archive.PERIOD_MONTHLY, timezone.now(), [{"id": 1}], rollup_of=(daily,), org=org
             )
-            self.mock_s3.put_object("temba-archives", file, body)
-            return archive
-
-        daily = add(create_archive(org, Archive.PERIOD_DAILY))
-        add(create_archive(org, Archive.PERIOD_MONTHLY, daily))
+        )
 
         # extra S3 file in archive dir
-        self.mock_s3.put_object("temba-archives", f"{org.id}/extra_file.json", io.StringIO("[]"))
+        Archive.storage().save(f"{org.id}/extra_file.json", io.StringIO("[]"))
 
     def _exists(self, obj) -> bool:
         return obj._meta.model.objects.filter(id=obj.id).exists()
@@ -1510,8 +1494,7 @@ class OrgDeleteTest(TembaTest):
         # make it look like released orgs were released over a week ago
         Org.objects.exclude(released_on=None).update(released_on=timezone.now() - timedelta(days=8))
 
-        with patch("temba.utils.s3.client", return_value=self.mock_s3):
-            delete_released_orgs()
+        delete_released_orgs()
 
         self.assertOrgDeleted(self.org, org1_content)
         self.assertOrgDeleted(org1_child1)
@@ -1519,14 +1502,14 @@ class OrgDeleteTest(TembaTest):
         self.assertOrgActive(self.org2, org2_content)
 
         # only org 2 files left in S3
-        self.assertEqual(
-            [
-                ("temba-archives", f"{self.org2.id}/archive2.jsonl.gz"),
-                ("temba-archives", f"{self.org2.id}/archive3.jsonl.gz"),
-                ("temba-archives", f"{self.org2.id}/extra_file.json"),
-            ],
-            list(self.mock_s3.objects.keys()),
-        )
+        for archive in self.org2.archives.all():
+            self.assertTrue(Archive.storage().exists(archive.get_storage_location()[1]))
+
+        self.assertTrue(Archive.storage().exists(f"{self.org2.id}/extra_file.json"))
+        self.assertFalse(Archive.storage().exists(f"{self.org.id}/extra_file.json"))
+
+        # check we've initiated search de-indexing for all deleted orgs
+        self.assertEqual([call(org1_child1), call(org1_child2), call(self.org)], mr_mocks.calls["org_deindex"])
 
         # we don't actually delete org objects but at this point there should be no related fields preventing that
         Model.delete(org1_child1)
@@ -1654,9 +1637,9 @@ class OrgCRUDLTest(TembaTest, CRUDLTestMixin):
         self.assertContains(response, "norkans7@gmail.com")
 
         # give users an API token
-        APIToken.get_or_create(self.org, self.admin)
-        APIToken.get_or_create(self.org, self.editor)
-        APIToken.get_or_create(self.org, editor2)
+        APIToken.create(self.org, self.admin)
+        APIToken.create(self.org, self.editor)
+        APIToken.create(self.org, editor2)
 
         # leave admin, editor and agent as is, but change user to an editor too, and remove the second editor
         response = self.assertUpdateSubmit(
@@ -1678,11 +1661,6 @@ class OrgCRUDLTest(TembaTest, CRUDLTestMixin):
         self.assertEqual({self.user, self.editor}, set(self.org.get_users(roles=[OrgRole.EDITOR])))
         self.assertEqual(set(), set(self.org.get_users(roles=[OrgRole.VIEWER])))
         self.assertEqual({self.agent}, set(self.org.get_users(roles=[OrgRole.AGENT])))
-
-        # our second editors API token should be deleted
-        self.assertEqual(self.admin.api_tokens.filter(is_active=True).count(), 1)
-        self.assertEqual(self.editor.api_tokens.filter(is_active=True).count(), 1)
-        self.assertEqual(editor2.api_tokens.filter(is_active=True).count(), 0)
 
         # pretend our first invite was acted on
         invitation1.release()
@@ -1746,14 +1724,6 @@ class OrgCRUDLTest(TembaTest, CRUDLTestMixin):
         self.assertEqual({self.user}, set(self.org.get_users(roles=[OrgRole.EDITOR])))
         self.assertEqual(set(), set(self.org.get_users(roles=[OrgRole.VIEWER])))
         self.assertEqual({self.editor}, set(self.org.get_users(roles=[OrgRole.AGENT])))
-
-        # editor will have lost their API tokens
-        self.editor.refresh_from_db()
-        self.assertEqual(0, self.editor.api_tokens.filter(is_active=True).count())
-
-        # and all our API tokens for the admin are deleted
-        self.admin.refresh_from_db()
-        self.assertEqual(self.admin.api_tokens.filter(is_active=True).count(), 0)
 
     def test_manage_children(self):
         children_url = reverse("orgs.org_sub_orgs")
@@ -2126,6 +2096,30 @@ class OrgCRUDLTest(TembaTest, CRUDLTestMixin):
         # should be logged out as the other user
         self.assertEqual(0, len(self.client.session.keys()))
 
+        # invitation with mismatching case email
+        invitation2 = Invitation.objects.create(
+            org=self.org2,
+            user_group="E",
+            email="eDwin@nyaruka.com",
+            created_by=self.admin2,
+            modified_by=self.admin2,
+        )
+
+        join_accept_url = reverse("orgs.org_join_accept", args=[invitation2.secret])
+        join_url = reverse("orgs.org_join", args=[invitation2.secret])
+
+        self.login(user)
+
+        response = self.client.get(join_url)
+        self.assertRedirect(response, join_accept_url)
+
+        # but only if they're the currently logged in user
+        self.login(self.admin)
+
+        response = self.client.get(join_url)
+        self.assertContains(response, "Sign in to join the <b>Trileet Inc.</b> workspace")
+        self.assertContains(response, f"/users/login/?next={join_accept_url}")
+
     def test_join_signup(self):
         # if invitation secret is invalid, redirect to root
         response = self.client.get(reverse("orgs.org_join_signup", args=["invalid"]))
@@ -2425,9 +2419,8 @@ class OrgCRUDLTest(TembaTest, CRUDLTestMixin):
         org = Org.objects.get(name="AlexCom")
         self.assertEqual(org.timezone, ZoneInfo("Africa/Kigali"))
 
-        # of which our user is an administrator and can generate an API token
+        # of which our user is an administrator
         self.assertIn(user, org.get_admins())
-        self.assertIsNotNone(user.get_api_token(org))
 
         # not the logged in user at the signup time
         self.assertNotIn(self.user, org.get_admins())
@@ -2532,9 +2525,8 @@ class OrgCRUDLTest(TembaTest, CRUDLTestMixin):
         self.assertEqual(org.timezone, ZoneInfo("Africa/Kigali"))
         self.assertEqual(str(org), "Relieves World")
 
-        # of which our user is an administrator, and can generate an API token
+        # of which our user is an administrator
         self.assertIn(user, org.get_admins())
-        self.assertIsNotNone(user.get_api_token(org))
 
         # check default org content was created correctly
         system_fields = set(org.fields.filter(is_system=True).values_list("key", flat=True))
@@ -3426,7 +3418,7 @@ class UserCRUDLTest(TembaTest, CRUDLTestMixin):
         self.login(self.admin)
 
         response = self.client.get(reverse("orgs.user_account"))
-        self.assertEqual(2, len(response.context["formax"].sections))
+        self.assertEqual(1, len(response.context["formax"].sections))
 
     def test_edit(self):
         edit_url = reverse("orgs.user_edit")
@@ -3753,25 +3745,38 @@ class UserCRUDLTest(TembaTest, CRUDLTestMixin):
         self.assertEqual(0, FailedLogin.objects.filter(username="admin@nyaruka.com").count())  # deleted
         self.assertEqual(1, FailedLogin.objects.filter(username="editor@nyaruka.com").count())  # unaffected
 
-    def test_token(self):
-        token_url = reverse("orgs.user_token")
+    def test_tokens(self):
+        tokens_url = reverse("orgs.user_tokens")
 
-        self.assertRequestDisallowed(token_url, [None, self.user, self.agent])
+        self.assertRequestDisallowed(tokens_url, [None, self.user, self.agent])
+        self.assertReadFetch(tokens_url, [self.admin], context_object=self.admin)
 
-        self.login(self.editor)
+        # add user to other org and create API tokens for both
+        self.org2.add_user(self.admin, OrgRole.EDITOR)
+        token1 = APIToken.create(self.org, self.admin)
+        token2 = APIToken.create(self.org, self.admin)
+        APIToken.create(self.org, self.editor)  # other user
+        APIToken.create(self.org2, self.admin)  # other org
 
-        editor_token = self.editor.get_api_token(self.org)
+        response = self.assertReadFetch(tokens_url, [self.admin], context_object=self.admin, choose_org=self.org)
+        self.assertEqual([token1, token2], list(response.context["tokens"]))
+        self.assertContentMenu(tokens_url, self.admin, ["New Token"], choose_org=self.org)
 
-        response = self.client.get(token_url)
-        self.assertContains(response, editor_token)
+        # can POST to create new token
+        response = self.client.post(tokens_url, {"new": "1"})
+        self.assertRedirect(response, reverse("orgs.user_tokens"))
+        self.assertEqual(3, self.admin.get_api_tokens(self.org).count())
+        token3 = self.admin.get_api_tokens(self.org).order_by("created").last()
 
-        # a post should refresh the token
-        response = self.client.post(token_url, {}, follow=True)
-        self.assertNotContains(response, editor_token)
+        # and now option to create new token is gone because we've reached the limit
+        response = self.assertReadFetch(tokens_url, [self.admin], context_object=self.admin, choose_org=self.org)
+        self.assertEqual([token1, token2, token3], list(response.context["tokens"]))
+        self.assertContentMenu(tokens_url, self.admin, [], choose_org=self.org)
 
-        new_token = self.editor.get_api_token(self.org)
-
-        self.assertContains(response, new_token)
+        # and POSTing is noop
+        response = self.client.post(tokens_url, {"new": "1"})
+        self.assertRedirect(response, reverse("orgs.user_tokens"))
+        self.assertEqual(3, self.admin.get_api_tokens(self.org).count())
 
     def test_verify_email(self):
         self.assertEqual(self.admin.settings.email_status, "U")
@@ -3878,9 +3883,7 @@ class BulkExportTest(TembaTest):
         export = DefinitionExport.create(self.org, self.admin, flows=flows, campaigns=campaigns)
         export.perform()
 
-        filename = f"{settings.MEDIA_ROOT}/test_orgs/{self.org.id}/definition_exports/{export.uuid}.json"
-
-        with open(filename) as export_file:
+        with default_storage.open(f"orgs/{self.org.id}/definition_exports/{export.uuid}.json") as export_file:
             definitions = json.loads(export_file.read())
 
         return definitions, export
@@ -3901,7 +3904,7 @@ class BulkExportTest(TembaTest):
     def test_trigger_dependency(self):
         # tests the case of us doing an export of only a single flow (despite dependencies) and making sure we
         # don't include the triggers of our dependent flows (which weren't exported)
-        self.import_file("parent_child_trigger")
+        self.import_file("test_flows/parent_child_trigger.json")
 
         parent = Flow.objects.filter(name="Parent Flow").first()
 
@@ -3913,7 +3916,7 @@ class BulkExportTest(TembaTest):
         self.assertFalse(exported["triggers"])
 
     def test_subflow_dependencies(self):
-        self.import_file("subflow")
+        self.import_file("test_flows/subflow.json")
 
         parent = Flow.objects.filter(name="Parent Flow").first()
         child = Flow.objects.filter(name="Child Flow").first()
@@ -3993,7 +3996,7 @@ class BulkExportTest(TembaTest):
             self.assertIsNone(Flow.objects.filter(org=self.org, name="New Mother").first())
 
     def test_import_campaign_with_translations(self):
-        self.import_file("campaign_import_with_translations")
+        self.import_file("test_flows/campaign_import_with_translations.json")
 
         campaign = Campaign.objects.all().first()
         event = campaign.events.all().first()
@@ -4011,7 +4014,7 @@ class BulkExportTest(TembaTest):
         self.assertEqual(flow_def["localization"]["eng"][action["uuid"]]["text"], ["Hey"])
 
     def test_reimport(self):
-        self.import_file("survey_campaign")
+        self.import_file("test_flows/survey_campaign.json")
 
         campaign = Campaign.objects.filter(is_active=True).last()
         event = campaign.events.filter(is_active=True).last()
@@ -4021,7 +4024,7 @@ class BulkExportTest(TembaTest):
         campaign.group.contacts.add(sally)
 
         # importing it again shouldn't result in failures
-        self.import_file("survey_campaign")
+        self.import_file("test_flows/survey_campaign.json")
 
         # get our latest campaign and event
         new_campaign = Campaign.objects.filter(is_active=True).last()
@@ -4032,7 +4035,7 @@ class BulkExportTest(TembaTest):
         self.assertNotEqual(event.id, new_event.id)
 
     def test_import_mixed_flow_versions(self):
-        self.import_file("mixed_versions")
+        self.import_file("test_flows/mixed_versions.json")
 
         group = ContactGroup.objects.get(name="Survey Audience")
 
@@ -4051,7 +4054,7 @@ class BulkExportTest(TembaTest):
         self.assertEqual(dep_graph[parent], {child})
 
     def test_import_dependency_types(self):
-        self.import_file("all_dependency_types")
+        self.import_file("test_flows/all_dependency_types.json")
 
         parent = Flow.objects.get(name="All Dep Types")
         child = Flow.objects.get(name="New Child")
@@ -4081,7 +4084,7 @@ class BulkExportTest(TembaTest):
         # final call is after new flows and dependencies have been committed so mailroom can see them
         mr_mocks.flow_inspect(dependencies=[{"key": "age", "name": "", "type": "field", "missing": False}])
 
-        self.import_file("color")
+        self.import_file("test_flows/color.json")
 
         flow = Flow.objects.get()
 
@@ -4089,7 +4092,7 @@ class BulkExportTest(TembaTest):
 
     def test_import_missing_flow_dependency(self):
         # in production this would blow up validating the flow but we can't do that during tests
-        self.import_file("parent_without_its_child")
+        self.import_file("test_flows/parent_without_its_child.json")
 
         parent = Flow.objects.get(name="Single Parent")
         self.assertEqual(set(parent.flow_dependencies.all()), set())
@@ -4097,7 +4100,7 @@ class BulkExportTest(TembaTest):
         # create child with that name and re-import
         child1 = Flow.create(self.org, self.admin, "New Child", Flow.TYPE_MESSAGE)
 
-        self.import_file("parent_without_its_child")
+        self.import_file("test_flows/parent_without_its_child.json")
         self.assertEqual(set(parent.flow_dependencies.all()), {child1})
 
         # create child with that UUID and re-import
@@ -4105,7 +4108,7 @@ class BulkExportTest(TembaTest):
             self.org, self.admin, "New Child 2", Flow.TYPE_MESSAGE, uuid="a925453e-ad31-46bd-858a-e01136732181"
         )
 
-        self.import_file("parent_without_its_child")
+        self.import_file("test_flows/parent_without_its_child.json")
         self.assertEqual(set(parent.flow_dependencies.all()), {child2})
 
     def validate_flow_dependencies(self, definition):
@@ -4132,7 +4135,7 @@ class BulkExportTest(TembaTest):
         """
         Tests importing flow definitions without fields and groups included in the export
         """
-        data = self.get_import_json("cataclysm")
+        data = self.load_json("test_flows/cataclysm.json")
 
         del data["fields"]
         del data["groups"]
@@ -4154,7 +4157,7 @@ class BulkExportTest(TembaTest):
         """
         Tests importing flow definitions with groups included in the export but not fields
         """
-        data = self.get_import_json("cataclysm")
+        data = self.load_json("test_flows/cataclysm.json")
         del data["fields"]
 
         mr_mocks.contact_parse_query("facts_per_day = 1", fields=["facts_per_day"])
@@ -4197,7 +4200,7 @@ class BulkExportTest(TembaTest):
         mr_mocks.contact_parse_query("facts_per_day = 1", fields=["facts_per_day"])
         mr_mocks.contact_parse_query("likes_cats = true", cleaned='likes_cats = "true"', fields=["likes_cats"])
 
-        self.import_file("cataclysm")
+        self.import_file("test_flows/cataclysm.json")
 
         flow = Flow.objects.get(name="Cataclysmic")
         self.validate_flow_dependencies(flow.get_definition())
@@ -4242,7 +4245,7 @@ class BulkExportTest(TembaTest):
             self.org, self.admin, Trigger.TYPE_KEYWORD, flow2, keywords=["rating"], match_type=Trigger.MATCH_FIRST_WORD
         )
 
-        data = self.get_import_json("rating_10")
+        data = self.load_json("test_flows/rating_10.json")
 
         self.org.import_app(data, self.admin, site="http://rapidpro.io")
 
@@ -4264,7 +4267,7 @@ class BulkExportTest(TembaTest):
         flow_trigger.archive(self.admin)
 
         # re import again will restore the trigger
-        data = self.get_import_json("rating_10")
+        data = self.load_json("test_flows/rating_10.json")
         self.org.import_app(data, self.admin, site="http://rapidpro.io")
 
         flow_trigger.refresh_from_db()
@@ -4312,7 +4315,7 @@ class BulkExportTest(TembaTest):
             )
 
         # import all our bits
-        self.import_file("the_clinic")
+        self.import_file("test_flows/the_clinic.json")
 
         confirm_appointment = Flow.objects.get(name="Confirm Appointment")
         self.assertEqual(10080, confirm_appointment.expires_after_minutes)
@@ -4334,7 +4337,7 @@ class BulkExportTest(TembaTest):
         message_flow.update_single_message_flow(self.admin, {"eng": "No reminders for you!"}, base_language="eng")
 
         # now reimport
-        self.import_file("the_clinic")
+        self.import_file("test_flows/the_clinic.json")
 
         # our flow should get reset from the import
         confirm_appointment.refresh_from_db()
@@ -4669,16 +4672,11 @@ class ExportCRUDLTest(TembaTest):
         self.assertEqual(1, self.admin.notifications.filter(notification_type="export:finished", is_seen=False).count())
 
         download_url = reverse("orgs.export_download", kwargs={"uuid": export.uuid})
-
         self.assertEqual(f"/export/download/{export.uuid}/", download_url)
-        self.assertEqual(
-            (
-                f"/media/test_orgs/{self.org.id}/ticket_exports/{export.uuid}.xlsx",
-                f"tickets_{datetime.today().strftime(r'%Y%m%d')}.xlsx",
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            ),
-            export.get_raw_access(),
-        )
+
+        raw_url = export.get_raw_url()
+        self.assertIn(f"{settings.STORAGE_URL}/orgs/{self.org.id}/ticket_exports/{export.uuid}.xlsx", raw_url)
+        self.assertIn(f"tickets_{datetime.today().strftime(r'%Y%m%d')}.xlsx", raw_url)
 
         response = self.client.get(download_url)
         self.assertLoginRedirect(response)
@@ -4697,7 +4695,4 @@ class ExportCRUDLTest(TembaTest):
         self.assertEqual(0, self.admin.notifications.filter(notification_type="export:finished", is_seen=False).count())
 
         response = self.client.get(download_url + "?raw=1")
-        self.assertEqual(200, response.status_code)
-        self.assertEqual(
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", response.headers["content-type"]
-        )
+        self.assertRedirect(response, f"/test-default/orgs/{self.org.id}/ticket_exports/{export.uuid}.xlsx")

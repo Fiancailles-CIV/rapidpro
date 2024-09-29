@@ -7,10 +7,9 @@ from typing import Any
 
 import iso8601
 import phonenumbers
-import pyexcel
 import regex
-import xlrd
 from django_redis import get_redis_connection
+from openpyxl import load_workbook
 from smartmin.models import SmartModel
 
 from django.conf import settings
@@ -30,7 +29,7 @@ from temba.orgs.models import DependencyMixin, Export, ExportType, Org, OrgRole,
 from temba.utils import chunk_list, format_number, on_transaction_commit
 from temba.utils.export import MultiSheetExporter
 from temba.utils.models import JSONField, LegacyUUIDMixin, SquashableModel, TembaModel, delete_in_batches
-from temba.utils.text import decode_stream, unsnakify
+from temba.utils.text import unsnakify
 from temba.utils.urns import ParsedURN, parse_number, parse_urn
 from temba.utils.uuid import uuid4
 
@@ -1058,12 +1057,16 @@ class Contact(LegacyUUIDMixin, SmartModel):
         Contact.bulk_change_status(user, [self], modifiers.Status.ACTIVE)
         self.refresh_from_db()
 
-    def release(self, user, *, immediately=False):
+    def release(self, user, *, immediately=False, deindex=True):
         """
         Releases this contact. Note that we clear all identifying data but don't hard delete the contact because we need
         to expose deleted contacts over the API to allow external systems to know that contacts have been deleted.
         """
         from .tasks import full_release_contact
+
+        # do de-indexing first so if it fails for some reason, we don't go through with the delete
+        if deindex:
+            mailroom.get_client().contact_deindex(self.org, [self])
 
         with transaction.atomic():
             # prep our urns for deletion so our old path creates a new urn
@@ -1944,7 +1947,7 @@ class ContactExport(ExportType):
 
 def get_import_upload_path(instance: Any, filename: str):
     ext = Path(filename).suffix.lower()
-    return f"{settings.STORAGE_ROOT_DIR}/{instance.org_id}/contact_imports/{uuid4()}{ext}"
+    return f"orgs/{instance.org_id}/contact_imports/{uuid4()}{ext}"
 
 
 class ContactImport(SmartModel):
@@ -1986,21 +1989,32 @@ class ContactImport(SmartModel):
         total number of records. Otherwise raises a ValidationError.
         """
 
-        file_type = Path(filename).suffix[1:].lower()
+        try:
+            workbook = load_workbook(filename=file, read_only=True, data_only=True)
+        except Exception:
+            raise ValidationError(_("Import file appears to be corrupted."))
+        ws = workbook.active
 
-        # CSV reader expects str stream so wrap file
-        if file_type == "csv":
-            file = decode_stream(file)
+        # see https://openpyxl.readthedocs.io/en/latest/optimized.html#worksheet-dimensions but even with this we need
+        # to ignore empty columns after the last column with data
+        ws.reset_dimensions()
+
+        data = ws.iter_rows()
 
         try:
-            data = pyexcel.iget_array(file_stream=file, file_type=file_type)
-        except xlrd.XLRDError:
-            raise ValidationError(_("Import file appears to be corrupted. Please save again in Excel and try again."))
-
-        try:
-            headers = [str(h).strip() for h in next(data)]
+            header_row = next(data)
         except StopIteration:
             raise ValidationError(_("Import file appears to be empty."))
+
+        headers = [h.value for h in header_row]
+        headers = [str(h).strip() if h else "" for h in headers]
+
+        # ignore empty header columns after the last column with data
+        max_col = 0
+        for h, header in enumerate(headers):
+            if header:
+                max_col = h
+        headers = headers[: max_col + 1]
 
         if any([h == "" for h in headers]):
             raise ValidationError(_("Import file contains an empty header."))
@@ -2018,8 +2032,6 @@ class ContactImport(SmartModel):
 
             try:
                 raw_row = next(data)
-            except xlrd.XLDateError:  # pragma: needs cover
-                raise ValidationError(_("Import file contains invalid date on row %(row)s."), params={"row": row_num})
             except StopIteration:
                 break
 
@@ -2197,12 +2209,11 @@ class ContactImport(SmartModel):
             self.group = ContactGroup.create_manual(self.org, self.created_by, name=self.group_name)
             self.save(update_fields=("group",))
 
-        # CSV reader expects str stream so wrap file
-        file_type = self._get_file_type()
-        file = decode_stream(self.file) if file_type == "csv" else self.file
-
         # parse each row, creating batch tasks for mailroom
-        data = pyexcel.iget_array(file_stream=file, file_type=file_type, start_row=1)
+        workbook = load_workbook(filename=self.file, read_only=True, data_only=True)
+        ws = workbook.active
+        ws.reset_dimensions()  # see https://openpyxl.readthedocs.io/en/latest/optimized.html#worksheet-dimensions
+        data = ws.iter_rows(min_row=2)
 
         urns = []
         batches = []
@@ -2288,12 +2299,6 @@ class ContactImport(SmartModel):
             "time_taken": int(time_taken.total_seconds()),
         }
 
-    def _get_file_type(self):
-        """
-        Returns one of xlxs, xls, or csv
-        """
-        return Path(self.file.name).suffix[1:].lower()
-
     @staticmethod
     def _parse_header(header: str) -> tuple[str, str]:
         """
@@ -2357,7 +2362,7 @@ class ContactImport(SmartModel):
         """
         parsed = []
         for i in range(size):
-            parsed.append(cls._parse_value(row[i], tz=tz) if i < len(row) else "")
+            parsed.append(cls._parse_value(row[i].value, tz=tz) if i < len(row) else "")
         return parsed
 
     @staticmethod
@@ -2375,7 +2380,7 @@ class ContactImport(SmartModel):
         elif isinstance(value, date):
             return value.isoformat()
         else:
-            return str(value).strip()
+            return str(value).strip() if value is not None else ""
 
     @classmethod
     def _detect_spamminess(cls, urns: list[str]) -> bool:

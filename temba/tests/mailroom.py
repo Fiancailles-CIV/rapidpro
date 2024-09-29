@@ -202,6 +202,10 @@ class TestClient(MailroomClient):
         )
 
     @_client_method
+    def contact_deindex(self, org, contacts):
+        return {"deindexed": len(contacts)}
+
+    @_client_method
     def contact_export(self, org, group, query: str) -> list[int]:
         if self.mocks._contact_export:
             return self.mocks._contact_export.pop(0)
@@ -368,6 +372,10 @@ class TestClient(MailroomClient):
             "created_on": msg.created_on.isoformat(),
             "modified_on": msg.modified_on.isoformat(),
         }
+
+    @_client_method
+    def org_deindex(self, org):
+        return {}
 
     @_client_method
     def ticket_assign(self, org, user, tickets, assignee):

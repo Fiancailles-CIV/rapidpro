@@ -590,7 +590,7 @@ class UserCRUDL(SmartCRUDL):
         "two_factor_disable",
         "two_factor_tokens",
         "account",
-        "token",
+        "tokens",
         "verify_email",
         "send_verification_email",
     )
@@ -1135,30 +1135,39 @@ class UserCRUDL(SmartCRUDL):
         def get_context_data(self, **kwargs):
             context = super().get_context_data(**kwargs)
             context["two_factor_enabled"] = self.request.user.settings.two_factor_enabled
+            context["num_api_tokens"] = self.request.user.get_api_tokens(self.request.org).count()
             return context
 
         def derive_formax_sections(self, formax, context):
             formax.add_section("profile", reverse("orgs.user_edit"), icon="user")
 
-            if self.has_org_perm("orgs.user_token"):
-                formax.add_section("token", reverse("orgs.user_token"), icon="upload", nobutton=True)
-
-    class Token(InferUserMixin, OrgPermsMixin, SmartUpdateView):
+    class Tokens(SpaMixin, InferUserMixin, ContentMenuMixin, OrgPermsMixin, SmartUpdateView):
         class Form(forms.ModelForm):
+            new = forms.BooleanField(required=False)
+
             class Meta:
                 model = User
                 fields = ()
 
         form_class = Form
-        submit_button_name = _("Regenerate")
+        title = _("API Tokens")
+        menu_path = "/settings/account"
+        success_url = "@orgs.user_tokens"
+        token_limit = 3
+
+        def build_content_menu(self, menu):
+            if self.request.user.get_api_tokens(self.request.org).count() < self.token_limit:
+                menu.add_url_post(_("New Token"), reverse("orgs.user_tokens") + "?new=1", as_button=True)
 
         def get_context_data(self, **kwargs):
             context = super().get_context_data(**kwargs)
-            context["api_token"] = self.request.user.get_api_token(self.request.org)
+            context["tokens"] = self.request.user.get_api_tokens(self.request.org).order_by("created")
+            context["token_limit"] = self.token_limit
             return context
 
         def form_valid(self, form):
-            APIToken.get_or_create(self.request.org, self.request.user, refresh=True)
+            if self.request.user.get_api_tokens(self.request.org).count() < self.token_limit:
+                APIToken.create(self.request.org, self.request.user)
 
             return super().form_valid(form)
 
@@ -2134,11 +2143,6 @@ class OrgCRUDL(SmartCRUDL):
                 elif org.get_user_role(user) != new_role:
                     org.add_user(user, new_role)
 
-                # when a user's role changes, delete any API tokens they're no longer allowed to have
-                for token in APIToken.objects.filter(org=org, user=user):
-                    if not token.is_valid():
-                        token.release()
-
             return obj
 
         def get_context_data(self, **kwargs):
@@ -2402,7 +2406,7 @@ class OrgCRUDL(SmartCRUDL):
 
             # if user exists and is logged in then they just need to accept
             user = User.get_by_email(self.invitation.email)
-            if user and self.invitation.email == request.user.username:
+            if user and self.invitation.email.lower() == request.user.username.lower():
                 return HttpResponseRedirect(reverse("orgs.org_join_accept", args=[secret]))
 
             logout(request)
@@ -3012,16 +3016,7 @@ class ExportCRUDL(SmartCRUDL):
             if str_to_bool(request.GET.get("raw", 0)):
                 export = self.get_object()
 
-                url, filename, mime_type = export.get_raw_access()
-
-                if url.startswith("http"):  # pragma: needs cover
-                    response = HttpResponseRedirect(url)
-                else:
-                    asset_file = open("." + url, "rb")
-                    response = HttpResponse(asset_file, content_type=mime_type)
-                    response["Content-Disposition"] = "attachment; filename=%s" % filename
-
-                return response
+                return HttpResponseRedirect(export.get_raw_url())
 
             return super().get(request, *args, **kwargs)
 

@@ -165,19 +165,22 @@ class ArchiveReadSerializer(ReadSerializer):
 
 class BroadcastReadSerializer(ReadSerializer):
     STATUSES = {
-        "I": "queued",  # may exist in older data
+        Broadcast.STATUS_PENDING: "pending",
         Broadcast.STATUS_QUEUED: "queued",
-        Broadcast.STATUS_SENT: "sent",
+        Broadcast.STATUS_STARTED: "started",
+        Broadcast.STATUS_COMPLETED: "completed",
         Broadcast.STATUS_FAILED: "failed",
+        Broadcast.STATUS_INTERRUPTED: "interrupted",
     }
 
+    status = serializers.SerializerMethodField()
+    progress = serializers.SerializerMethodField()
     urns = serializers.SerializerMethodField()
     contacts = fields.ContactField(many=True)
     groups = fields.ContactGroupField(many=True)
     text = serializers.SerializerMethodField()
     attachments = serializers.SerializerMethodField()
     base_language = fields.LanguageField()
-    status = serializers.SerializerMethodField()
     created_on = serializers.DateTimeField(default_timezone=tzone.utc)
 
     def get_text(self, obj):
@@ -187,7 +190,10 @@ class BroadcastReadSerializer(ReadSerializer):
         return {lang: trans.get("attachments", []) for lang, trans in obj.translations.items()}
 
     def get_status(self, obj):
-        return self.STATUSES.get(obj.status, "sent")
+        return self.STATUSES[obj.status]
+
+    def get_progress(self, obj):
+        return {"total": obj.contact_count or -1, "started": obj.msg_count}
 
     def get_urns(self, obj):
         if self.context["org"].is_anon:
@@ -197,7 +203,18 @@ class BroadcastReadSerializer(ReadSerializer):
 
     class Meta:
         model = Broadcast
-        fields = ("id", "urns", "contacts", "groups", "text", "attachments", "base_language", "status", "created_on")
+        fields = (
+            "id",
+            "status",
+            "progress",
+            "urns",
+            "contacts",
+            "groups",
+            "text",
+            "attachments",
+            "base_language",
+            "created_on",
+        )
 
 
 class BroadcastWriteSerializer(WriteSerializer):
@@ -1077,13 +1094,16 @@ class FlowRunReadSerializer(ReadSerializer):
 class FlowStartReadSerializer(ReadSerializer):
     STATUSES = {
         FlowStart.STATUS_PENDING: "pending",
-        FlowStart.STATUS_STARTING: "starting",
-        FlowStart.STATUS_COMPLETE: "complete",
+        FlowStart.STATUS_QUEUED: "queued",
+        FlowStart.STATUS_STARTED: "started",
+        FlowStart.STATUS_COMPLETED: "completed",
         FlowStart.STATUS_FAILED: "failed",
+        FlowStart.STATUS_INTERRUPTED: "interrupted",
     }
 
     flow = fields.FlowField()
     status = serializers.SerializerMethodField()
+    progress = serializers.SerializerMethodField()
     groups = fields.ContactGroupField(many=True)
     contacts = fields.ContactField(many=True)
     params = serializers.JSONField(required=False)
@@ -1098,6 +1118,9 @@ class FlowStartReadSerializer(ReadSerializer):
     def get_status(self, obj):
         return self.STATUSES.get(obj.status)
 
+    def get_progress(self, obj):
+        return {"total": obj.contact_count or -1, "started": obj.run_count}
+
     def get_restart_participants(self, obj):
         return not (obj.exclusions and obj.exclusions.get(FlowStart.EXCLUSION_STARTED_PREVIOUSLY, False))
 
@@ -1107,15 +1130,17 @@ class FlowStartReadSerializer(ReadSerializer):
     class Meta:
         model = FlowStart
         fields = (
-            "id",
             "uuid",
             "flow",
             "status",
+            "progress",
             "groups",
             "contacts",
             "params",
             "created_on",
             "modified_on",
+            # deprecated
+            "id",
             "extra",
             "restart_participants",
             "exclude_active",

@@ -841,6 +841,7 @@ class ContactCRUDL(SmartCRUDL):
         """
 
         fields = ()
+        success_url = "uuid@contacts.contact_read"
 
         def save(self, obj):
             obj.interrupt(self.request.user)
@@ -1156,7 +1157,7 @@ class ContactImportCRUDL(SmartCRUDL):
 
     class Create(SpaMixin, OrgPermsMixin, SmartCreateView):
         class Form(forms.ModelForm):
-            file = forms.FileField(validators=[FileExtensionValidator(allowed_extensions=("xls", "xlsx", "csv"))])
+            file = forms.FileField(validators=[FileExtensionValidator(allowed_extensions=("xlsx",))])
 
             def __init__(self, *args, org, **kwargs):
                 self.org = org
@@ -1407,6 +1408,7 @@ class ContactImportCRUDL(SmartCRUDL):
 
     class Read(SpaMixin, OrgObjPermsMixin, NotificationTargetMixin, SmartReadView):
         menu_path = "/contact/import"
+        title = _("Contact Import")
 
         def get_notification_scope(self) -> tuple:
             return "import:finished", f"contact:{self.object.id}"
